@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Models and Checkpoints
+*.pt
+*.pth
+checkpoints/
+
+# Datasets
+dummy_sharded_dataset/
+*.parquet
+
+# Output Audio
+*.wav
+
+# System
+.DS_Store
