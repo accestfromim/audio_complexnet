@@ -86,10 +86,16 @@ def main():
         epoch_loss = 0.0
         num_batches = 0
         for batch_idx, batch in enumerate(train_dataloader, start=1):
-            # inputs = batch["inputs_features"].to(device) # Handled by accelerator
-            inputs = batch["inputs_features"]
-            attention_mask = batch["attention_mask"]
-            target_frames = batch["target_frames"]
+            inputs_full = batch["inputs_features"]
+            attention_full = batch["attention_mask"]
+            targets_full = batch["target_frames"]
+
+            if inputs_full.size(1) < 2:
+                continue
+
+            inputs = inputs_full[:, :-1, :]
+            target_frames = targets_full[:, 1:, :]
+            attention_mask = attention_full[:, :-1]
 
             outputs = model(input_ids=inputs, attention_mask=attention_mask, use_cache=False)
             preds = outputs.logits
@@ -117,16 +123,22 @@ def main():
             print()
             print(f"Epoch {epoch} finished. Average Loss: {avg_loss:.6f}")
         
-        # Validation Loop
         if val_dataloader:
             model.eval()
             val_loss = 0.0
             val_batches = 0
             with torch.no_grad():
                 for batch in val_dataloader:
-                    inputs = batch["inputs_features"]
-                    attention_mask = batch["attention_mask"]
-                    target_frames = batch["target_frames"]
+                    inputs_full = batch["inputs_features"]
+                    attention_full = batch["attention_mask"]
+                    targets_full = batch["target_frames"]
+
+                    if inputs_full.size(1) < 2:
+                        continue
+
+                    inputs = inputs_full[:, :-1, :]
+                    target_frames = targets_full[:, 1:, :]
+                    attention_mask = attention_full[:, :-1]
 
                     outputs = model(input_ids=inputs, attention_mask=attention_mask, use_cache=False)
                     preds = outputs.logits

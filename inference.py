@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--input_audio", type=str, required=True, help="Path to input audio file")
     parser.add_argument("--output_audio", type=str, default="output.wav", help="Path to save output audio")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--num_gen_frames", type=int, default=50, help="Number of frames to autoregressively generate")
     
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -78,19 +79,18 @@ def main():
     
     wav = wav.to(device)
     
-    # Frame audio [1, Num_Frames, Frame_Len]
     frames = frame_audio(wav, sr, frame_ms, hop_ms).unsqueeze(0).to(device)
     
     print(f"Input shape (frames): {frames.shape}")
     
-    # 4. Inference
-    print("Running inference...")
+    print("Running autoregressive generation...")
     with torch.no_grad():
-        # Input to model is now frames directly
-        # Model returns logits (which are also frames in this architecture)
-        outputs = model(input_ids=frames)
-        predicted_frames = outputs.logits # [1, Num_Frames, Frame_Len]
-        
+        generated = frames
+        for _ in range(args.num_gen_frames):
+            outputs = model(input_ids=generated)
+            next_frame = outputs.logits[:, -1, :].unsqueeze(1)
+            generated = torch.cat([generated, next_frame], dim=1)
+    predicted_frames = generated
     print(f"Output shape (frames): {predicted_frames.shape}")
     
     # 5. Reconstruction (Overlap-Add)
