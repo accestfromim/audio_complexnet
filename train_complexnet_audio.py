@@ -7,7 +7,7 @@ from datasets import DatasetDict
 from AudioComplexNet.configuration_complexnet import ComplexNetConfig
 from AudioComplexNet.modeling_complexnet_dummy_new import ComplexNetLM
 from prepare import dataset, collator, custom_freqs
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 import os
 
 
@@ -36,12 +36,12 @@ def get_validation_dataset():
                 return dataset[name]
     return None
 
-
 def main():
-    accelerator = Accelerator()
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    accelerator = Accelerator(mixed_precision="bf16", kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     
-    sr = 16000
+    sr = collator.sr
     frame_ms = 25.0
     hop_ms = 10.0
     
@@ -54,14 +54,14 @@ def main():
     # model.to(device) # Handled by accelerator.prepare
 
     train_dataset = get_train_dataset()
-    train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collator)
+    train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collator)
 
     val_dataset = get_validation_dataset()
     val_dataloader = None
     if val_dataset:
         if accelerator.is_main_process:
             print(f"Validation dataset found with {len(val_dataset)} samples.")
-        val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False, collate_fn=collator)
+        val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collator)
     else:
         if accelerator.is_main_process:
             print("No validation dataset found. Skipping validation.")
@@ -81,10 +81,11 @@ def main():
     model.train()
 
     num_epochs = 10
+    total_batches = len(train_dataloader)
     for epoch in range(num_epochs):
         epoch_loss = 0.0
         num_batches = 0
-        for batch in train_dataloader:
+        for batch_idx, batch in enumerate(train_dataloader, start=1):
             # inputs = batch["inputs_features"].to(device) # Handled by accelerator
             inputs = batch["inputs_features"]
             attention_mask = batch["attention_mask"]
@@ -99,12 +100,21 @@ def main():
             optimizer.step()
 
             if accelerator.is_main_process:
-                print(f"epoch {epoch} batch_loss {loss.item():.6f}")
+                progress = batch_idx / total_batches
+                bar_len = 30
+                filled_len = int(bar_len * progress)
+                bar = "=" * filled_len + "." * (bar_len - filled_len)
+                print(
+                    f"\rEpoch {epoch} [{bar}] {batch_idx}/{total_batches} loss {loss.item():.6f}",
+                    end="",
+                    flush=True,
+                )
             epoch_loss += loss.item()
             num_batches += 1
-        
+
         avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
         if accelerator.is_main_process:
+            print()
             print(f"Epoch {epoch} finished. Average Loss: {avg_loss:.6f}")
         
         # Validation Loop
@@ -156,4 +166,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

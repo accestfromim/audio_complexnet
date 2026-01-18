@@ -1392,8 +1392,8 @@ class ComplexNetLM(PreTrainedModel, GenerationMixin):
         self.hidden_size = self.config.hidden_size
         self.num_hidden_layers = self.config.num_hidden_layers
         self.use_cache = self.config.use_cache
-        self.token_embeddings_real = nn.Embedding(self.n_vocab, self.hidden_size)
-        self.token_embeddings_imag = nn.Embedding(self.n_vocab, self.hidden_size)
+        #self.token_embeddings_real = nn.Embedding(self.n_vocab, self.hidden_size)
+        #self.token_embeddings_imag = nn.Embedding(self.n_vocab, self.hidden_size)
         self.final_norm = ComplexNetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer = nn.ModuleList(
             [
@@ -1403,7 +1403,7 @@ class ComplexNetLM(PreTrainedModel, GenerationMixin):
         )
         self.gradient_checkpointing = False
         self.rotary_emb = ComplexNetRotaryEmbedding(self.config)
-        self.lm_head = nn.Linear(self.hidden_size * 2, self.n_vocab, bias=False)
+        #self.lm_head = nn.Linear(self.hidden_size * 2, self.n_vocab, bias=False)
         self.sr=sr
         self.register_buffer("freqs", freqs)
         self.frame_ms=frame_ms

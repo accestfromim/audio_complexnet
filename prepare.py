@@ -50,6 +50,7 @@ class CustomAudioDataCollator:
     hop_ms: float = 10.0
     freqs: torch.Tensor = None  
     return_complex: bool = False # False=返回实虚拼接, True=返回复数Tensor
+    max_frames: int = 512
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         """
@@ -70,6 +71,10 @@ class CustomAudioDataCollator:
         
         # 3. 批量分帧 -> [Batch, Num_Frames, Frame_Len]
         frames = batch_frame_audio(padded_waves, self.sr, self.frame_ms, self.hop_ms)
+
+        # 可选：截断过长序列，控制显存开销
+        if self.max_frames is not None and frames.shape[1] > self.max_frames:
+            frames = frames[:, : self.max_frames]
         
         # 4. 批量自定义 DFT (已移入模型内部，此处直接返回 Frames)
         # 确保 freqs 在正确的 device 上 (通常 collator 在 CPU 上运行)
@@ -95,7 +100,7 @@ class CustomAudioDataCollator:
         max_frames = inputs.shape[1]
         attention_mask = torch.zeros((len(features), max_frames), dtype=torch.long)
         
-        for i, valid_len in enumerate(valid_frames):
+        for i, valid_len in enumerate(valid_frames.clamp(max=max_frames)):
             attention_mask[i, :valid_len] = 1
             
         batch = {
@@ -110,7 +115,7 @@ class CustomAudioDataCollator:
              
         return batch
     
-HIDDEN_SIZE = 128
+HIDDEN_SIZE = 256 * 2
 # 这里可以是 Mel 频率，或者是线性频率
 custom_freqs = torch.linspace(0, 8000, HIDDEN_SIZE) 
 
@@ -119,7 +124,7 @@ custom_freqs = torch.linspace(0, 8000, HIDDEN_SIZE)
 # "dummy_folder": 加载生成的 dummy_sharded_dataset 文件夹（模拟分片数据集）
 # "hf_librispeech": 加载 Hugging Face 的 LibriSpeech (需要网络)
 # "custom": 加载你自己指定的数据集目录
-DATASET_MODE = "dummy_folder" 
+DATASET_MODE = "hf_librispeech" 
 
 # 你的真实数据集路径配置
 CUSTOM_DATASET_PATH = "/path/to/your/dataset/folder" 
@@ -152,8 +157,19 @@ try:
         dataset = DatasetDict(data_dict) if len(data_dict) > 1 else list(data_dict.values())[0]
 
     elif DATASET_MODE == "hf_librispeech":
-        # 加载官方 LibriSpeech
-        dataset = load_dataset("openslr/librispeech_asr", "clean", split="train.100")
+        # 加载官方 LibriSpeech：同时构造 train 和 validation
+        dataset = DatasetDict(
+            {
+                "train": load_dataset(
+                    "openslr/librispeech_asr", "clean", split="train.100"
+                ),
+                "validation": load_dataset(
+                    "openslr/librispeech_asr", "clean", split="validation"
+                ),
+            }
+        )
+        # 显式关闭内部解码，避免依赖 torchcodec，仅保留路径/bytes 供自定义解码使用
+        dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE, decode=False))
         
     elif DATASET_MODE == "custom":
         # 加载自定义目录
@@ -169,7 +185,17 @@ try:
 
 except Exception as e:
     print(f"加载数据集失败 ({e})，尝试回退到默认 LibriSpeech 数据集用于演示...")
-    dataset = load_dataset("openslr/librispeech_asr", "clean", split="train.100")
+    dataset = DatasetDict(
+        {
+            "train": load_dataset(
+                "openslr/librispeech_asr", "clean", split="train.100"
+            ),
+            "validation": load_dataset(
+                "openslr/librispeech_asr", "clean", split="validation"
+            ),
+        }
+    )
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE, decode=False))
 
 
 # 移除 cast_column，避免 datasets 内部解码依赖问题 (如 torchcodec/ffmpeg)
@@ -251,8 +277,15 @@ else:
     column_names = dataset.column_names
 
 cols_to_remove = [col for col in column_names if col != "input_values"]
+'''
+dataset = dataset.map(
+    preprocess_function,
+    remove_columns=cols_to_remove,
+    load_from_cache_file=False,
+    num_proc=4,
+)
+'''
 dataset = dataset.map(preprocess_function, remove_columns=cols_to_remove, load_from_cache_file=False)
-
 # 确保输出为 PyTorch Tensor
 dataset.set_format(type="torch", columns=["input_values"])
 
