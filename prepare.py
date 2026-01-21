@@ -115,9 +115,9 @@ class CustomAudioDataCollator:
              
         return batch
     
-HIDDEN_SIZE = 256 * 2
+NUM_FREQS = 257 # Standard STFT size for n_fft=512 (Nyquist at 8kHz)
 # 这里可以是 Mel 频率，或者是线性频率
-custom_freqs = torch.linspace(0, 8000, HIDDEN_SIZE) 
+custom_freqs = torch.linspace(0, 8000, NUM_FREQS) 
 
 # 模式选择：
 # "dummy_file": 加载单个 dummy_train.parquet
