@@ -285,7 +285,7 @@ dataset = dataset.map(
     num_proc=4,
 )
 '''
-dataset = dataset.map(preprocess_function, remove_columns=cols_to_remove, load_from_cache_file=False)
+dataset = dataset.map(preprocess_function, remove_columns=cols_to_remove, load_from_cache_file=True)
 # 确保输出为 PyTorch Tensor
 dataset.set_format(type="torch", columns=["input_values"])
 

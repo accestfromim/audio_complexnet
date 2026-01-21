@@ -5,9 +5,9 @@ import argparse
 import os
 from AudioComplexNet.configuration_complexnet import ComplexNetConfig
 from AudioComplexNet.modeling_complexnet_dummy_new import ComplexNetLM
-from prepare import custom_freqs
 from utils import frame_audio, overlap_add
 
+custom_freqs = torch.linspace(0, 8000, 512)
 def main():
     parser = argparse.ArgumentParser(description="Inference for ComplexNet Audio Model")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model checkpoint (.pt)")
@@ -83,14 +83,30 @@ def main():
     
     print(f"Input shape (frames): {frames.shape}")
     
+    # 4. Autoregressive Generation (next-frame prediction)
     print("Running autoregressive generation...")
     with torch.no_grad():
-        generated = frames
+        context_len = 512
+        generated = frames[:, -context_len:, :]
+        attention = torch.ones(
+            generated.shape[:2], dtype=torch.long, device=device
+        )
+        
+        all_frames = frames
         for _ in range(args.num_gen_frames):
-            outputs = model(input_ids=generated)
+            outputs = model(
+                input_ids=generated, attention_mask=attention, use_cache=False
+            )
             next_frame = outputs.logits[:, -1, :].unsqueeze(1)
+            
+            all_frames = torch.cat([all_frames, next_frame], dim=1)
             generated = torch.cat([generated, next_frame], dim=1)
-    predicted_frames = generated
+            if generated.size(1) > context_len:
+                generated = generated[:, -context_len:, :]
+            attention = torch.ones(
+                generated.shape[:2], dtype=torch.long, device=device
+            )
+    predicted_frames = all_frames
     print(f"Output shape (frames): {predicted_frames.shape}")
     
     # 5. Reconstruction (Overlap-Add)
