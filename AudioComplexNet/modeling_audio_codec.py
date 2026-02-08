@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from torch.nn import init
+from torch.nn.utils import spectral_norm
 from .utils import frame2vector, vector2frame
 
 class ComplexConv1d(nn.Module):
@@ -280,59 +281,74 @@ class ComplexReLU(nn.Module):
         return real * mask, imag * mask
 
 class ResBlock(nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=1):
+    def __init__(self, channels, kernel_size=3, dilation=1, causal=False):
         super().__init__()
-        self.conv1 = CausalComplexConv1d(channels, channels, kernel_size, dilation=dilation)
+        self.conv1 = CausalComplexConv1d(channels, channels, kernel_size, dilation=dilation, causal=causal)
         self.bn1 = ComplexBatchNorm1d(channels)
-        self.conv2 = CausalComplexConv1d(channels, channels, kernel_size, dilation=dilation) 
+        self.act1 = ComplexReLU()
+        self.conv2 = CausalComplexConv1d(channels, channels, kernel_size, dilation=dilation, causal=causal) 
         self.bn2 = ComplexBatchNorm1d(channels)
+        self.act2 = ComplexReLU()
 
     def forward(self, x_real, x_imag):
         residual_real, residual_imag = x_real, x_imag
         
         y_real, y_imag = self.conv1(x_real, x_imag)
         y_real, y_imag = self.bn1(y_real, y_imag)
-        y_real = F.elu(y_real)
-        y_imag = F.elu(y_imag)
+        y_real, y_imag = self.act1(y_real, y_imag)
         
         y_real, y_imag = self.conv2(y_real, y_imag)
         y_real, y_imag = self.bn2(y_real, y_imag)
-        y_real = F.elu(y_real)
-        y_imag = F.elu(y_imag)
+        y_real, y_imag = self.act2(y_real, y_imag)
         
         return residual_real + y_real, residual_imag + y_imag
 
 class CausalComplexConv1d(nn.Module):
     """
     Causal Complex Convolution.
-    Pads only on the left.
+    If causal=True, Pads only on the left.
+    If causal=False, Uses symmetric padding (Same).
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, causal=False):
         super().__init__()
-        self.padding = (kernel_size - 1) * dilation
-        self.conv = ComplexConv1d(in_channels, out_channels, kernel_size, stride=stride, padding=0, dilation=dilation)
+        self.causal = causal
+        self.padding_val = (kernel_size - 1) * dilation
+        
+        if causal:
+            self.conv = ComplexConv1d(in_channels, out_channels, kernel_size, stride=stride, padding=0, dilation=dilation)
+        else:
+            # Symmetric padding
+            pad = self.padding_val // 2
+            self.conv = ComplexConv1d(in_channels, out_channels, kernel_size, stride=stride, padding=pad, dilation=dilation)
         
     def forward(self, x_real, x_imag):
-        # Pad left
-        x_real = F.pad(x_real, (self.padding, 0))
-        x_imag = F.pad(x_imag, (self.padding, 0))
+        if self.causal:
+            # Pad left
+            x_real = F.pad(x_real, (self.padding_val, 0))
+            x_imag = F.pad(x_imag, (self.padding_val, 0))
         return self.conv(x_real, x_imag)
 
 class VectorQuantizer(nn.Module):
     """
     Standard Vector Quantization module.
     """
-    def __init__(self, n_e, e_dim, beta=0.25):
+    def __init__(self, n_e, e_dim, beta=10.0):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
         self.beta = beta
 
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
-        self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
+        # self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e) # Too small for large n_e
+        self.embedding.weight.data.normal_(mean=0.0, std=0.02) # Standard initialization
 
     def forward(self, z):
         # z: [b, c, t] -> [b, t, c]
+        # FORCE DETACH Z for GAN Fine-tuning
+        # This prevents gradients flowing back to Encoder and High Grad Norm
+        # Also allows Codebook to update (via Codebook Loss) without dragging Encoder
+        z = z.detach() 
+        
         z = z.permute(0, 2, 1).contiguous()
         z_flattened = z.view(-1, self.e_dim)
         
@@ -350,7 +366,11 @@ class VectorQuantizer(nn.Module):
         z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
 
         # compute loss for embedding
-        loss = torch.mean((z_q.detach() - z)**2) + self.beta * torch.mean((z_q - z.detach())**2)
+        # Modified for Frozen Encoder Fine-tuning:
+        # z is already detached at start of forward.
+        # So we only compute Codebook Loss (update e towards z).
+        # We remove beta scaling because this is the primary loss for Codebook now.
+        loss = torch.mean((z_q - z.detach())**2)
 
         # preserve gradients
         z_q = z + (z_q - z).detach()
@@ -364,7 +384,7 @@ class ResidualVQ(nn.Module):
     """
     Residual Vector Quantizer.
     """
-    def __init__(self, num_quantizers, n_e, e_dim, beta=0.25):
+    def __init__(self, num_quantizers, n_e, e_dim, beta=10.0):
         super().__init__()
         self.layers = nn.ModuleList([
             VectorQuantizer(n_e, e_dim, beta) for _ in range(num_quantizers)
@@ -385,45 +405,67 @@ class ResidualVQ(nn.Module):
         
         # Stack indices: [B, T, N_layers]
         all_indices = torch.stack(all_indices, dim=-1)
-        total_loss = torch.stack(all_losses).sum()
+        # Return individual losses for weighting
+        # total_loss = torch.stack(all_losses).sum()
         
-        return quantized_out, total_loss, all_indices
+        return quantized_out, all_losses, all_indices
+
+    def from_codes(self, codes):
+        """
+        Reconstruct quantized latents from codes.
+        codes: [B, T, N_quantizers]
+        """
+        quantized_out = 0.0
+        # codes is [B, T, N_q]
+        # We need to iterate over layers
+        
+        for i, layer in enumerate(self.layers):
+            # layer codes: [B, T]
+            idx = codes[..., i]
+            # get embeddings: [B, T, D]
+            z_q = layer.embedding(idx)
+            # permute to [B, D, T]
+            z_q = z_q.permute(0, 2, 1)
+            quantized_out = quantized_out + z_q
+            
+        return quantized_out
 
 class ComplexEncoder(nn.Module):
-    def __init__(self, in_channels, hidden_dim, latent_dim):
+    def __init__(self, in_channels, hidden_dim, latent_dim, causal=False):
         super().__init__()
         self.in_channels = in_channels
+        self.causal = causal
         
         # Initial Conv (Causal)
-        self.conv_in = CausalComplexConv1d(in_channels, hidden_dim, 7)
+        self.conv_in = CausalComplexConv1d(in_channels, hidden_dim, 7, causal=causal)
         self.bn_in = ComplexBatchNorm1d(hidden_dim)
+        self.act_in = ComplexReLU()
         
         # Downsampling blocks with dilation for large receptive field
         self.blocks = nn.ModuleList([
-            # Stride 2
-            CausalComplexConv1d(hidden_dim, hidden_dim, 3, stride=2), # Down 1
-            ResBlock(hidden_dim, 3, dilation=3),
-            ResBlock(hidden_dim, 3, dilation=9),
+            # Stride 2 (120 -> 60)
+            CausalComplexConv1d(hidden_dim, hidden_dim, 3, stride=2, causal=causal), # Down 1
+            ResBlock(hidden_dim, 3, dilation=3, causal=causal),
+            ResBlock(hidden_dim, 3, dilation=9, causal=causal),
             
-            # Stride 2
-            CausalComplexConv1d(hidden_dim, hidden_dim, 3, stride=2), # Down 2
-            ResBlock(hidden_dim, 3, dilation=3),
-            ResBlock(hidden_dim, 3, dilation=9),
+            # Stride 1 (60 -> 60)
+            CausalComplexConv1d(hidden_dim, hidden_dim, 3, stride=1, causal=causal), # Down 2 (Stride 1)
+            ResBlock(hidden_dim, 3, dilation=3, causal=causal),
+            ResBlock(hidden_dim, 3, dilation=9, causal=causal),
         ])
         
-        self.conv_out = CausalComplexConv1d(hidden_dim, latent_dim, 3)
+        self.conv_out = CausalComplexConv1d(hidden_dim, latent_dim, 3, causal=causal)
+        self.act_block = ComplexReLU()
 
     def forward(self, x_real, x_imag):
         x_real, x_imag = self.conv_in(x_real, x_imag)
         x_real, x_imag = self.bn_in(x_real, x_imag)
-        x_real = F.elu(x_real)
-        x_imag = F.elu(x_imag)
+        x_real, x_imag = self.act_in(x_real, x_imag)
         
         for block in self.blocks:
             if isinstance(block, CausalComplexConv1d):
                 x_real, x_imag = block(x_real, x_imag)
-                x_real = F.elu(x_real)
-                x_imag = F.elu(x_imag)
+                x_real, x_imag = self.act_block(x_real, x_imag)
             else:
                 x_real, x_imag = block(x_real, x_imag)
                 
@@ -431,98 +473,159 @@ class ComplexEncoder(nn.Module):
         return x_real, x_imag
 
 class ComplexDecoder(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, out_channels):
+    def __init__(self, latent_dim, hidden_dim, out_channels, causal=False):
         super().__init__()
+        self.causal = causal
         
-        self.conv_in = CausalComplexConv1d(latent_dim, hidden_dim, 7)
+        self.conv_in = CausalComplexConv1d(latent_dim, hidden_dim, 7, causal=causal)
+        self.act_in = ComplexReLU()
         
         # Upsampling blocks (Mirror Encoder)
         self.blocks = nn.ModuleList([
-            ResBlock(hidden_dim, 3, dilation=9),
-            ResBlock(hidden_dim, 3, dilation=3),
-            ComplexConvTranspose1d(hidden_dim, hidden_dim, 3, stride=2, padding=1, output_padding=1), # Up 1
+            ResBlock(hidden_dim, 3, dilation=9, causal=causal),
+            ResBlock(hidden_dim, 3, dilation=3, causal=causal),
+            ComplexConvTranspose1d(hidden_dim, hidden_dim, 3, stride=1, padding=1, output_padding=0), # Up 1 (Stride 1)
             
-            ResBlock(hidden_dim, 3, dilation=9),
-            ResBlock(hidden_dim, 3, dilation=3),
+            ResBlock(hidden_dim, 3, dilation=9, causal=causal),
+            ResBlock(hidden_dim, 3, dilation=3, causal=causal),
             ComplexConvTranspose1d(hidden_dim, hidden_dim, 3, stride=2, padding=1, output_padding=1), # Up 2
         ])
         
-        self.conv_out = CausalComplexConv1d(hidden_dim, out_channels, 7)
+        self.conv_out = CausalComplexConv1d(hidden_dim, out_channels, 7, causal=causal)
+        self.act_block = ComplexReLU()
 
     def forward(self, x_real, x_imag):
         x_real, x_imag = self.conv_in(x_real, x_imag)
-        x_real = F.elu(x_real)
-        x_imag = F.elu(x_imag)
+        x_real, x_imag = self.act_in(x_real, x_imag)
         
         for block in self.blocks:
             if isinstance(block, ComplexConvTranspose1d):
                 x_real, x_imag = block(x_real, x_imag)
-                x_real = F.elu(x_real)
-                x_imag = F.elu(x_imag)
+                x_real, x_imag = self.act_block(x_real, x_imag)
             else:
                 x_real, x_imag = block(x_real, x_imag)
                 
         x_real, x_imag = self.conv_out(x_real, x_imag)
         return x_real, x_imag
 
-class Discriminator(nn.Module):
+class SingleScaleDiscriminator(nn.Module):
     """
-    Complex PatchGAN Discriminator.
-    Input: Complex Spectrogram [B, F, T] (Real, Imag)
-    Output: Real score map (unbounded, for Hinge Loss)
+    PatchGAN Discriminator on Concatenated Real/Imag Spectrograms.
+    Input: Complex Spectrogram [B, F, T] (Real, Imag) separated.
+    Output: Real score map.
     """
-    def __init__(self, input_channels=1, hidden_dim=64): 
-        # input_channels is usually 1 (Mono Complex Spectrogram treated as 1 channel image)
+    def __init__(self, input_channels=2, hidden_dim=64): # Reduced base dim for Multi-Scale
         super().__init__()
         
-        # We use ComplexConv2d
-        self.conv1 = ComplexConv2d(input_channels, hidden_dim, (3, 3), padding=(1, 1))
-        self.conv2 = ComplexConv2d(hidden_dim, hidden_dim*2, (3, 3), stride=(2, 2), padding=(1, 1))
-        self.conv3 = ComplexConv2d(hidden_dim*2, hidden_dim*4, (3, 3), stride=(2, 2), padding=(1, 1))
-        self.conv4 = ComplexConv2d(hidden_dim*4, 1, (3, 3), padding=(1, 1))
+        self.conv_in = spectral_norm(nn.Conv2d(input_channels, hidden_dim, kernel_size=4, stride=2, padding=1))
         
-        self.act = ComplexReLU()
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                spectral_norm(nn.Conv2d(hidden_dim, hidden_dim * 2, kernel_size=4, stride=2, padding=1)),
+                nn.LeakyReLU(0.2, inplace=True),
+            ),
+            nn.Sequential(
+                spectral_norm(nn.Conv2d(hidden_dim * 2, hidden_dim * 4, kernel_size=4, stride=2, padding=1)),
+                nn.LeakyReLU(0.2, inplace=True),
+            ),
+            nn.Sequential(
+                spectral_norm(nn.Conv2d(hidden_dim * 4, hidden_dim * 8, kernel_size=4, stride=2, padding=1)),
+                nn.LeakyReLU(0.2, inplace=True),
+            ),
+             nn.Sequential(
+                spectral_norm(nn.Conv2d(hidden_dim * 8, hidden_dim * 16, kernel_size=4, stride=2, padding=1)),
+                nn.LeakyReLU(0.2, inplace=True),
+            ),
+        ])
         
-    def forward(self, real, imag):
-        # Input: [B, T, F] -> Need [B, 1, F, T] (Treating Freq as Height, Time as Width)
-        # Note: Codec output is [B, T, F].
+        self.conv_out = spectral_norm(nn.Conv2d(hidden_dim * 16, 1, kernel_size=4, stride=1, padding=1))
+
+    def forward(self, x):
+        # Input: [B, 2, F, T]
+        features = []
+        
+        x = self.conv_in(x)
+        x = F.leaky_relu(x, 0.2)
+        features.append(x)
+        
+        for block in self.blocks:
+            x = block(x)
+            features.append(x)
+            
+        x = self.conv_out(x)
+        features.append(x)
+        
+        return x, features
+
+class Discriminator(nn.Module):
+    """
+    Multi-Scale Discriminator (3 scales)
+    """
+    def __init__(self, input_channels=2, hidden_dim=64):
+        super().__init__()
+        self.discriminators = nn.ModuleList([
+            SingleScaleDiscriminator(input_channels, hidden_dim),
+            SingleScaleDiscriminator(input_channels, hidden_dim),
+            SingleScaleDiscriminator(input_channels, hidden_dim)
+        ])
+        
+        self.downsample = nn.AvgPool2d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+    def forward(self, real, imag, mag=None):
+        # Input: [B, T, F]
+        # Treat Freq as Height (H), Time as Width (W).
+        # We want [B, C, H, W] = [B, 2, F, T] (or 3 if mag provided)
         
         if real.dim() == 3:
-            real = real.permute(0, 2, 1).unsqueeze(1) # [B, 1, F, T]
-            imag = imag.permute(0, 2, 1).unsqueeze(1)
+            # [B, T, F] -> [B, F, T]
+            real = real.permute(0, 2, 1)
+            imag = imag.permute(0, 2, 1)
+            if mag is not None:
+                mag = mag.permute(0, 2, 1)
+        
+        # Stack to [B, C, F, T]
+        if mag is not None:
+            x = torch.stack([real, imag, mag], dim=1)
+        else:
+            x = torch.stack([real, imag], dim=1)
+        
+        outputs = []
+        features_list = []
+        for i, d in enumerate(self.discriminators):
+            if i > 0:
+                x = self.downsample(x)
+            score, feats = d(x)
+            outputs.append(score)
+            features_list.append(feats)
             
-        x_real, x_imag = self.conv1(real, imag)
-        x_real, x_imag = self.act(x_real, x_imag) # LeakyReLU 0.2 equivalent? User specified specific ReLU.
-        
-        x_real, x_imag = self.conv2(x_real, x_imag)
-        x_real, x_imag = self.act(x_real, x_imag)
-        
-        x_real, x_imag = self.conv3(x_real, x_imag)
-        x_real, x_imag = self.act(x_real, x_imag)
-        
-        x_real, x_imag = self.conv4(x_real, x_imag)
-        # No activation on final layer for PatchGAN logits
-        
-        # Output is Complex [B, 1, F', T'].
-        # For Hinge Loss, we need a Real scalar.
-        # Common approach: Return Real part.
-        return x_real
+        return outputs, features_list
 
 class AudioCodec(nn.Module):
-    def __init__(self, sr=16000, freqs=None, frame_ms=25.0, hop_ms=10.0, 
-                 hidden_dim=64, latent_dim=32, n_codebook=1024, n_quantizers=8):
+    def __init__(self, sr=16000, freqs=None, frame_ms=32.0, hop_ms=8.0, 
+                 hidden_dim=512, latent_dim=1536, n_codebook=4096, n_quantizers=8, causal=False,
+                 quantizer_weights=None):
         super().__init__()
         self.sr = sr
         self.register_buffer("freqs", freqs)
         self.frame_ms = frame_ms
         self.hop_ms = hop_ms
+        # With hop_ms=8.0ms -> 125Hz STFT
+        # Encoder Downsample x2 -> 62.5Hz Tokens
+        self.causal = causal
+        
+        # RVQ Weights
+        if quantizer_weights is None:
+            # Default: Uniform weights
+            quantizer_weights = [1.0] * n_quantizers
+        assert len(quantizer_weights) == n_quantizers, "quantizer_weights must match n_quantizers"
+        self.register_buffer("quantizer_weights", torch.tensor(quantizer_weights, dtype=torch.float32))
         
         num_freqs = freqs.numel()
         # Input channels for Complex Conv is num_freqs (Real part) + num_freqs (Imag part)
         # But ComplexConv1d expects in_channels to mean "Complex Channels".
         # Since our input is [Freq_1, Freq_2, ...], we have num_freqs "channels".
         
-        self.encoder = ComplexEncoder(num_freqs, hidden_dim, latent_dim)
+        self.encoder = ComplexEncoder(num_freqs, hidden_dim, latent_dim, causal=causal)
         
         # RVQ is real-valued. We need to project Complex Latent -> Real Latent for Quantization
         # Or quantize Real/Imag separately? 
@@ -531,7 +634,7 @@ class AudioCodec(nn.Module):
         
         self.quantizer = ResidualVQ(n_quantizers, n_codebook, latent_dim * 2) # *2 for Real+Imag
         
-        self.decoder = ComplexDecoder(latent_dim, hidden_dim, num_freqs)
+        self.decoder = ComplexDecoder(latent_dim, hidden_dim, num_freqs, causal=causal)
 
     def forward(self, frames):
         """
@@ -539,8 +642,18 @@ class AudioCodec(nn.Module):
         """
         spec_vector = frame2vector(frames, self.sr, self.freqs) # [B, T, F] Complex
         
-        real = spec_vector.real
-        imag = spec_vector.imag
+        # --- Power-Law Compression (Alpha=0.3) ---
+        # Helps with High Freq reconstruction by compressing dynamic range
+        # X_compressed = |X|^0.3 * exp(j * angle(X))
+        mag = torch.abs(spec_vector)
+        phase = torch.angle(spec_vector)
+        # Avoid zero division or nan
+        mag = torch.clamp(mag, min=1e-7)
+        mag_compressed = torch.pow(mag, 0.3)
+        spec_compressed = torch.polar(mag_compressed, phase)
+        
+        real = spec_compressed.real
+        imag = spec_compressed.imag
         
         # Prepare for Conv1d: [B, F, T]
         real_in = real.permute(0, 2, 1)
@@ -553,7 +666,12 @@ class AudioCodec(nn.Module):
         z = torch.cat([z_real, z_imag], dim=1) # [B, 2*Latent, T']
         
         # Quantize
-        z_q, commit_loss, codes = self.quantizer(z)
+        z_q, all_losses, codes = self.quantizer(z)
+        
+        # Compute Weighted Commitment Loss
+        commit_loss = 0.0
+        for i, loss in enumerate(all_losses):
+            commit_loss += loss * self.quantizer_weights[i]
         
         # Unflatten
         z_q_real, z_q_imag = torch.chunk(z_q, 2, dim=1)
@@ -565,14 +683,44 @@ class AudioCodec(nn.Module):
         real_hat = x_hat_real.permute(0, 2, 1) # [B, T, F]
         imag_hat = x_hat_imag.permute(0, 2, 1)
         
+        # --- Inverse Power-Law Compression ---
+        # X_recon = |X_hat|^(1/0.3) * exp(j * angle(X_hat))
+        spec_hat_compressed = torch.complex(real_hat, imag_hat)
+        mag_hat_compressed = torch.abs(spec_hat_compressed)
+        phase_hat = torch.angle(spec_hat_compressed)
+        
+        # Safety: Clamp compressed magnitude to avoid explosion during inverse power (x^3.33)
+        # 50^3.33 is ~450,000, which is large but safe for float32. 
+        # 100^3.33 is ~4.6 million.
+        # If the model outputs garbage > 100, we get explosion.
+        mag_hat_compressed = torch.clamp(mag_hat_compressed, max=50.0)
+        
+        mag_hat = torch.pow(mag_hat_compressed, 1.0/0.3)
+        # Re-construct complex
+        spec_hat = torch.polar(mag_hat, phase_hat)
+        
+        real_hat = spec_hat.real
+        imag_hat = spec_hat.imag
+        
+        # Note: We return both the "compressed" output (for latent loss?) 
+        # No, usually we compute loss on the final decompressed output.
+        
         # Align shapes if needed (due to Conv/Deconv padding differences)
         if real_hat.shape[1] != real.shape[1]:
-            # Crop to min length
-            min_len = min(real_hat.shape[1], real.shape[1])
+            # Crop to min length (Reference is original Real/Imag derived from Spec)
+            # But wait, 'real' variable above is COMPRESSED.
+            # We need original uncompressed 'spec_vector' for reference if we want to return it.
+            # Let's realign everything to 'spec_vector' shape
+            min_len = min(real_hat.shape[1], spec_vector.shape[1])
             real_hat = real_hat[:, :min_len, :]
             imag_hat = imag_hat[:, :min_len, :]
-            real = real[:, :min_len, :]
-            imag = imag[:, :min_len, :]
+            # real = real[:, :min_len, :] # This is compressed
+            # imag = imag[:, :min_len, :] # This is compressed
+            
+            # Update spec_vector crop too for consistency in return
+            # spec_vector = spec_vector[:, :min_len, :]
+            
+            # Actually, let's just crop outputs.
         
         frames_hat = vector2frame(real_hat, imag_hat, self.sr, self.freqs, frames.shape[-1])
         
@@ -580,8 +728,33 @@ class AudioCodec(nn.Module):
             "frames_hat": frames_hat,
             "real_hat": real_hat,
             "imag_hat": imag_hat,
-            "real": real,
-            "imag": imag,
+            "real": spec_vector.real, # Return UNCOMPRESSED original for Loss
+            "imag": spec_vector.imag, # Return UNCOMPRESSED original for Loss
             "commit_loss": commit_loss,
             "codes": codes
         }
+
+    def decode_from_codes(self, codes):
+        """
+        Decode from discrete codes.
+        codes: [B, T, N_quantizers]
+        """
+        # Get quantized latents
+        z_q = self.quantizer.from_codes(codes) # [B, 2*Latent, T]
+        
+        # Unflatten
+        z_q_real, z_q_imag = torch.chunk(z_q, 2, dim=1)
+        
+        # Decode
+        x_hat_real, x_hat_imag = self.decoder(z_q_real, z_q_imag) # [B, F, T]
+        
+        # Post-process
+        real_hat = x_hat_real.permute(0, 2, 1) # [B, T, F]
+        imag_hat = x_hat_imag.permute(0, 2, 1)
+        
+        # We can estimate frame_len from sr and frame_ms.
+        frame_len = int(self.sr * self.frame_ms / 1000)
+        
+        frames_hat = vector2frame(real_hat, imag_hat, self.sr, self.freqs, frame_len)
+        
+        return frames_hat

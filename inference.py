@@ -111,7 +111,7 @@ def main():
     
     # 5. Reconstruction (Overlap-Add)
     hop_length = int(sr * hop_ms / 1000)
-    output_wav = overlap_add(predicted_frames, hop_length)
+    output_wav = overlap_add(predicted_frames, hop_length, window="hann")
     
     # Remove batch dimension and move to CPU
     output_wav = output_wav.squeeze(0).cpu().numpy()

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import os
 from torch.nn.utils.rnn import pad_sequence
 from dataclasses import dataclass
@@ -46,8 +47,8 @@ def batch_frame2vector(frames, sr, freqs):
 @dataclass
 class CustomAudioDataCollator:
     sr: int = 16000
-    frame_ms: float = 25.0
-    hop_ms: float = 10.0
+    frame_ms: float = 32.0 # Standard 75% Overlap (with hop=8ms)
+    hop_ms: float = 8.0 # Modified to 8.0ms for 125Hz (128 samples)
     freqs: torch.Tensor = None  
     return_complex: bool = False # False=返回实虚拼接, True=返回复数Tensor
     max_frames: int = 512
@@ -61,6 +62,12 @@ class CustomAudioDataCollator:
         # 1. 提取波形 (List of Tensors)
         # 假设 dataset map 之后字段叫 'input_values'
         waveforms = [f["input_values"] for f in features]
+        
+        # Centered Padding for Hanning Window
+        # added zhangxi
+        frame_len = int(self.sr * self.frame_ms / 1000)
+        pad_len = frame_len // 2
+        waveforms = [F.pad(w, (pad_len, pad_len)) for w in waveforms]
         
         # 记录原始波形长度，用于计算 mask
         original_lengths = torch.tensor([w.shape[0] for w in waveforms], dtype=torch.long)
@@ -115,8 +122,7 @@ class CustomAudioDataCollator:
              
         return batch
     
-NUM_FREQS = 257 # Standard STFT size for n_fft=512 (Nyquist at 8kHz)
-# 这里可以是 Mel 频率，或者是线性频率
+NUM_FREQS = 400
 custom_freqs = torch.linspace(0, 8000, NUM_FREQS) 
 
 # 模式选择：
@@ -128,6 +134,10 @@ DATASET_MODE = "hf_librispeech"
 
 # 你的真实数据集路径配置
 CUSTOM_DATASET_PATH = "/path/to/your/dataset/folder" 
+
+# Define Custom Cache Directory
+CACHE_DIR = "/home/zhangxi/audio_cache_new"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 try:
     if DATASET_MODE == "dummy_file":
@@ -161,10 +171,10 @@ try:
         dataset = DatasetDict(
             {
                 "train": load_dataset(
-                    "openslr/librispeech_asr", "clean", split="train.100"
+                    "openslr/librispeech_asr", "clean", split="train.100", cache_dir=CACHE_DIR
                 ),
                 "validation": load_dataset(
-                    "openslr/librispeech_asr", "clean", split="validation"
+                    "openslr/librispeech_asr", "clean", split="validation", cache_dir=CACHE_DIR
                 ),
             }
         )
@@ -188,10 +198,10 @@ except Exception as e:
     dataset = DatasetDict(
         {
             "train": load_dataset(
-                "openslr/librispeech_asr", "clean", split="train.100"
+                "openslr/librispeech_asr", "clean", split="train.100", cache_dir=CACHE_DIR
             ),
             "validation": load_dataset(
-                "openslr/librispeech_asr", "clean", split="validation"
+                "openslr/librispeech_asr", "clean", split="validation", cache_dir=CACHE_DIR
             ),
         }
     )
@@ -291,8 +301,9 @@ dataset.set_format(type="torch", columns=["input_values"])
 
 collator = CustomAudioDataCollator(
     sr=16000,
-    frame_ms=25.0,
-    hop_ms=10.0,
+    frame_ms=32.0,
+    hop_ms=8.0, # 50% Overlap (Standard)
     freqs=custom_freqs,
-    return_complex=False # 大模型通常选 False，输入实数向量
+    return_complex=False, # 大模型通常选 False，输入实数向量
+    max_frames=None
 )

@@ -31,11 +31,17 @@ def frame2vector(frames,sr,freqs):
     device = frames.device
     frame_len = frames.shape[-1]
     t = torch.arange(frame_len, device=device) / sr  # 时间轴
+    
+    # Apply Hanning Window to reduce spectral leakage
+    # We apply window here because this is the Analysis step (Forward)
+    window = torch.hann_window(frame_len, device=device)
+    frames_windowed = frames * window.unsqueeze(0) # Broadcast to [N, L]
+    
     # freqs = torch.tensor(freqs, device=device).float()
     # 计算复指数矩阵: exp(-j 2π f t)
     exp_matrix = torch.exp(-2j * torch.pi * freqs.unsqueeze(1) * t.unsqueeze(0))  # [num_freqs, frame_len]
     # 矩阵乘法实现DFT
-    vector = torch.matmul(frames.to(torch.complex64), exp_matrix.T)  # [num_frames, num_freqs]
+    vector = torch.matmul(frames_windowed.to(torch.complex64), exp_matrix.T)  # [num_frames, num_freqs]
     return vector
 def frame2vector_nufft(frames, sr, freqs):
     """
@@ -68,6 +74,49 @@ def frame2vector_nufft(frames, sr, freqs):
     
     # spectrum = spectrum.squeeze(1)  # [num_frames, num_freqs]
     return spectrum
+
+def overlap_add(frames, hop_length, window=None):
+    """
+    Overlap-Add with optional Synthesis Window (Weighted OLA)
+    frames: [Batch, Num_Frames, Frame_Len] or [Num_Frames, Frame_Len]
+    """
+    if frames.dim() == 2:
+        frames = frames.unsqueeze(0) # [1, N, L]
+        
+    batch_size, num_frames, frame_len = frames.shape
+    device = frames.device
+    
+    total_len = (num_frames - 1) * hop_length + frame_len
+    
+    output = torch.zeros(batch_size, total_len, device=device)
+    overlap_count = torch.zeros(total_len, device=device)
+    
+    if window is None:
+        window = torch.ones(frame_len, device=device)
+        
+    # Apply Synthesis Window: x * w
+    # If Analysis was x * w, then now we have x * w^2
+    frames = frames * window.view(1, 1, -1)
+    weight = window ** 2
+    
+    # Vectorized OLA? Hard with variable strides. Loop is fine for training if not too slow.
+    # Actually, we can use F.fold but it's for constant stride. Here stride is constant.
+    # But F.fold is 2D/3D. 
+    # Let's stick to loop for clarity, it's fast enough on GPU for audio lengths.
+    
+    # But we need to handle Batch.
+    
+    for i in range(num_frames):
+        start = i * hop_length
+        end = start + frame_len
+        output[:, start:end] += frames[:, i, :]
+        overlap_count[start:end] += weight
+        
+    # Normalize
+    mask = overlap_count > 1e-4
+    output[:, mask] /= overlap_count[mask]
+    
+    return output
 
 # def vector2frame(vector,sr,freqs,frame_len):
 #     """
@@ -112,22 +161,54 @@ def vector2frame(vector_real, vector_imag, sr, freqs, frame_len):
     num_freqs = vector_real.shape[-1]
 
     # Ensure freqs is on the correct device
-    if freqs.device != device:
+    if not isinstance(freqs, torch.Tensor):
+        freqs = torch.tensor(freqs, device=device)
+    elif freqs.device != device:
         freqs = freqs.to(device)
 
     # 时间轴 t
     t = torch.arange(frame_len, device=device).float() / sr   # [frame_len]
 
+    '''
+    # Original implementation using Transpose (Assuming Orthogonality)
     angle = 2 * torch.pi * freqs.unsqueeze(1) * t.unsqueeze(0)   # [num_freqs, frame_len]
     cos_term = torch.cos(angle)
     sin_term = torch.sin(angle)
 
-
     out_real = torch.matmul(vector_real, cos_term) - torch.matmul(vector_imag, sin_term)
 
-
-
     reconstructed = out_real / num_freqs
+    return reconstructed
+    '''
+
+    # New implementation using Pseudo-Inverse (Least Squares) on Real System
+    # Solves for Real X such that X @ A.T = V (complex)
+    # Equivalent to minimizing || X @ Re(A).T - Re(V) ||^2 + || X @ Im(A).T - Im(V) ||^2
+    
+    exp_matrix = torch.exp(-2j * torch.pi * freqs.unsqueeze(1) * t.unsqueeze(0)) # [F, L]
+    
+    # Construct System Matrix M [2F, L]
+    # We want to solve: X @ [Re(A).T, Im(A).T] = [Re(V), Im(V)]
+    # Let M_T = [Re(A).T, Im(A).T] (shape L x 2F)
+    # Then M = [Re(A); Im(A)] (shape 2F x L)
+    # Solution: X = [Re(V), Im(V)] @ pinv(M_T) = [Re(V), Im(V)] @ pinv(M).T
+    
+    # Force FP32 for Matrix Construction and PINV to avoid underflow/overflow/singularity in BF16
+    M = torch.cat([exp_matrix.real, exp_matrix.imag], dim=0).float() # [2F, L]
+    
+    # Compute pseudo-inverse
+    # Use rcond to improve stability
+    M_pinv = torch.linalg.pinv(M, rcond=1e-5) # [L, 2F]
+    
+    # Prepare target vector
+    y = torch.cat([vector_real, vector_imag], dim=-1).float() # [B, N, 2F]
+    
+    # Reconstruct
+    reconstructed = torch.matmul(y, M_pinv.T) # [B, N, L]
+    
+    # Cast back to original dtype if needed, or keep float32 for safety
+    reconstructed = reconstructed.to(vector_real.dtype)
+    
     return reconstructed
 def vector2frame_nufft(vector,sr,freqs,frame_len):
     omega = 2 * torch.pi * freqs / sr

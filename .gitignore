@@ -7,6 +7,14 @@ __pycache__/
 *.pt
 *.pth
 checkpoints/
+checkpoints_codec/
+checkpoints_codec_gan/
+out6/
+out7/
+overfit_results_v4/
+audio_recon.wav
+gt_recon.wav
+codec_modelbkup.pth
 
 # Datasets
 dummy_sharded_dataset/
