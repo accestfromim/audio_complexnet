@@ -48,7 +48,7 @@ def batch_frame2vector(frames, sr, freqs):
 class CustomAudioDataCollator:
     sr: int = 16000
     frame_ms: float = 32.0 # Standard 75% Overlap (with hop=8ms)
-    hop_ms: float = 8.0 # Modified to 8.0ms for 125Hz (128 samples)
+    hop_ms: float = 10.0 # Modified to 10.0ms for 100Hz
     freqs: torch.Tensor = None  
     return_complex: bool = False # False=返回实虚拼接, True=返回复数Tensor
     max_frames: int = 512
@@ -82,6 +82,16 @@ class CustomAudioDataCollator:
         # 可选：截断过长序列，控制显存开销
         if self.max_frames is not None and frames.shape[1] > self.max_frames:
             frames = frames[:, : self.max_frames]
+            
+            # 同时截断 padded_waves 以匹配 frames
+            # 计算截断后的波形长度
+            # frames.shape[1] = num_frames
+            # num_frames = (T - frame_len) // hop + 1
+            # T = (num_frames - 1) * hop + frame_len
+            hop_length = int(self.sr * self.hop_ms / 1000)
+            target_wav_len = (frames.shape[1] - 1) * hop_length + frame_len
+            if padded_waves.shape[1] > target_wav_len:
+                padded_waves = padded_waves[:, :target_wav_len]
         
         # 4. 批量自定义 DFT (已移入模型内部，此处直接返回 Frames)
         # 确保 freqs 在正确的 device 上 (通常 collator 在 CPU 上运行)
@@ -112,6 +122,7 @@ class CustomAudioDataCollator:
             
         batch = {
             "inputs_features": inputs.float(),
+            "inputs_wav": padded_waves.float(), # Added raw waveform
             "attention_mask": attention_mask,
             "target_frames": frames.float(),
         }
@@ -302,7 +313,7 @@ dataset.set_format(type="torch", columns=["input_values"])
 collator = CustomAudioDataCollator(
     sr=16000,
     frame_ms=32.0,
-    hop_ms=8.0, # 50% Overlap (Standard)
+    hop_ms=10.0, # 100Hz (68.75% Overlap)
     freqs=custom_freqs,
     return_complex=False, # 大模型通常选 False，输入实数向量
     max_frames=None

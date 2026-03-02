@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from torch.nn import init
-from torch.nn.utils import spectral_norm
+from torch.nn.utils import spectral_norm, weight_norm
 from .utils import frame2vector, vector2frame
 
 class ComplexConv1d(nn.Module):
@@ -124,16 +124,17 @@ class ComplexConvTranspose1d(nn.Module):
 class ComplexConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
         super().__init__()
+        from torch.nn.modules.utils import _pair
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kernel_size = kernel_size
+        self.kernel_size = _pair(kernel_size)
         self.stride = stride
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
         
-        self.weight_real = nn.Parameter(torch.Tensor(out_channels, in_channels // groups, *kernel_size))
-        self.weight_imag = nn.Parameter(torch.Tensor(out_channels, in_channels // groups, *kernel_size))
+        self.weight_real = nn.Parameter(torch.Tensor(out_channels, in_channels // groups, *self.kernel_size))
+        self.weight_imag = nn.Parameter(torch.Tensor(out_channels, in_channels // groups, *self.kernel_size))
         
         if bias:
             self.bias_real = nn.Parameter(torch.Tensor(out_channels))
@@ -281,25 +282,48 @@ class ComplexReLU(nn.Module):
         return real * mask, imag * mask
 
 class ResBlock(nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=1, causal=False):
+    """
+    Bottleneck Residual Block
+    Structure:
+    1. 1x1 Conv (Expansion): Channel Mixing / Up-projection
+    2. 3x3 Conv (Temporal): Contextual Processing (with Dilation)
+    3. 1x1 Conv (Reduction): Channel Mixing / Down-projection
+    """
+    def __init__(self, channels, kernel_size=3, dilation=1, causal=False, expansion=2):
         super().__init__()
-        self.conv1 = CausalComplexConv1d(channels, channels, kernel_size, dilation=dilation, causal=causal)
-        self.bn1 = ComplexBatchNorm1d(channels)
+        hidden_channels = channels * expansion
+        
+        # 1. Expansion (1x1 Linear-like mixing)
+        self.conv1 = ComplexConv1d(channels, hidden_channels, kernel_size=1)
+        self.bn1 = ComplexBatchNorm1d(hidden_channels)
         self.act1 = ComplexReLU()
-        self.conv2 = CausalComplexConv1d(channels, channels, kernel_size, dilation=dilation, causal=causal) 
-        self.bn2 = ComplexBatchNorm1d(channels)
+        
+        # 2. Temporal Processing (3x3 with Dilation)
+        self.conv2 = CausalComplexConv1d(hidden_channels, hidden_channels, kernel_size, dilation=dilation, causal=causal) 
+        self.bn2 = ComplexBatchNorm1d(hidden_channels)
         self.act2 = ComplexReLU()
+        
+        # 3. Reduction (1x1 Linear-like mixing)
+        self.conv3 = ComplexConv1d(hidden_channels, channels, kernel_size=1)
+        self.bn3 = ComplexBatchNorm1d(channels)
+        # No activation after final projection, similar to Transformer FFN / ResNet Bottleneck
 
     def forward(self, x_real, x_imag):
         residual_real, residual_imag = x_real, x_imag
         
+        # 1. Expansion
         y_real, y_imag = self.conv1(x_real, x_imag)
         y_real, y_imag = self.bn1(y_real, y_imag)
         y_real, y_imag = self.act1(y_real, y_imag)
         
+        # 2. Temporal
         y_real, y_imag = self.conv2(y_real, y_imag)
         y_real, y_imag = self.bn2(y_real, y_imag)
         y_real, y_imag = self.act2(y_real, y_imag)
+        
+        # 3. Reduction
+        y_real, y_imag = self.conv3(y_real, y_imag)
+        y_real, y_imag = self.bn3(y_real, y_imag)
         
         return residual_real + y_real, residual_imag + y_imag
 
@@ -344,11 +368,6 @@ class VectorQuantizer(nn.Module):
 
     def forward(self, z):
         # z: [b, c, t] -> [b, t, c]
-        # FORCE DETACH Z for GAN Fine-tuning
-        # This prevents gradients flowing back to Encoder and High Grad Norm
-        # Also allows Codebook to update (via Codebook Loss) without dragging Encoder
-        z = z.detach() 
-        
         z = z.permute(0, 2, 1).contiguous()
         z_flattened = z.view(-1, self.e_dim)
         
@@ -366,11 +385,12 @@ class VectorQuantizer(nn.Module):
         z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
 
         # compute loss for embedding
-        # Modified for Frozen Encoder Fine-tuning:
-        # z is already detached at start of forward.
-        # So we only compute Codebook Loss (update e towards z).
-        # We remove beta scaling because this is the primary loss for Codebook now.
-        loss = torch.mean((z_q - z.detach())**2)
+        # Codebook Loss: update embeddings to match encoder outputs
+        loss_codebook = torch.mean((z_q - z.detach())**2)
+        # Commitment Loss: update encoder to produce outputs close to embeddings
+        loss_commit = torch.mean((z_q.detach() - z)**2)
+        
+        loss = loss_codebook + self.beta * loss_commit
 
         # preserve gradients
         z_q = z + (z_q - z).detach()
@@ -386,8 +406,13 @@ class ResidualVQ(nn.Module):
     """
     def __init__(self, num_quantizers, n_e, e_dim, beta=10.0):
         super().__init__()
+        
+        if isinstance(n_e, int):
+            n_e = [n_e] * num_quantizers
+        assert len(n_e) == num_quantizers, "n_e list must match num_quantizers"
+        
         self.layers = nn.ModuleList([
-            VectorQuantizer(n_e, e_dim, beta) for _ in range(num_quantizers)
+            VectorQuantizer(n_e[i], e_dim, beta) for i in range(num_quantizers)
         ])
 
     def forward(self, x):
@@ -442,14 +467,17 @@ class ComplexEncoder(nn.Module):
         self.act_in = ComplexReLU()
         
         # Downsampling blocks with dilation for large receptive field
+        # Increased capacity: [1, 3, 9] dilation pattern
         self.blocks = nn.ModuleList([
             # Stride 2 (120 -> 60)
             CausalComplexConv1d(hidden_dim, hidden_dim, 3, stride=2, causal=causal), # Down 1
+            ResBlock(hidden_dim, 3, dilation=1, causal=causal),
             ResBlock(hidden_dim, 3, dilation=3, causal=causal),
             ResBlock(hidden_dim, 3, dilation=9, causal=causal),
             
-            # Stride 1 (60 -> 60)
-            CausalComplexConv1d(hidden_dim, hidden_dim, 3, stride=1, causal=causal), # Down 2 (Stride 1)
+            # Stride 2 (60 -> 30)
+            CausalComplexConv1d(hidden_dim, hidden_dim, 3, stride=2, causal=causal), # Down 2 (Stride 2)
+            ResBlock(hidden_dim, 3, dilation=1, causal=causal),
             ResBlock(hidden_dim, 3, dilation=3, causal=causal),
             ResBlock(hidden_dim, 3, dilation=9, causal=causal),
         ])
@@ -481,14 +509,17 @@ class ComplexDecoder(nn.Module):
         self.act_in = ComplexReLU()
         
         # Upsampling blocks (Mirror Encoder)
+        # Increased capacity: [1, 3, 9] dilation pattern
         self.blocks = nn.ModuleList([
             ResBlock(hidden_dim, 3, dilation=9, causal=causal),
             ResBlock(hidden_dim, 3, dilation=3, causal=causal),
-            ComplexConvTranspose1d(hidden_dim, hidden_dim, 3, stride=1, padding=1, output_padding=0), # Up 1 (Stride 1)
+            ResBlock(hidden_dim, 3, dilation=1, causal=causal),
+            ComplexConvTranspose1d(hidden_dim, hidden_dim, 3, stride=2, padding=1, output_padding=1), # Up 1 (Stride 2)
             
             ResBlock(hidden_dim, 3, dilation=9, causal=causal),
             ResBlock(hidden_dim, 3, dilation=3, causal=causal),
-            ComplexConvTranspose1d(hidden_dim, hidden_dim, 3, stride=2, padding=1, output_padding=1), # Up 2
+            ResBlock(hidden_dim, 3, dilation=1, causal=causal),
+            ComplexConvTranspose1d(hidden_dim, hidden_dim, 3, stride=2, padding=1, output_padding=1), # Up 2 (Stride 2)
         ])
         
         self.conv_out = CausalComplexConv1d(hidden_dim, out_channels, 7, causal=causal)
@@ -508,117 +539,313 @@ class ComplexDecoder(nn.Module):
         x_real, x_imag = self.conv_out(x_real, x_imag)
         return x_real, x_imag
 
-class SingleScaleDiscriminator(nn.Module):
+class ComplexSingleScaleDiscriminator(nn.Module):
     """
-    PatchGAN Discriminator on Concatenated Real/Imag Spectrograms.
-    Input: Complex Spectrogram [B, F, T] (Real, Imag) separated.
+    Complex PatchGAN Discriminator.
+    Input: Complex Spectrogram [B, 1, F, T] (Real, Imag).
     Output: Real score map.
     """
-    def __init__(self, input_channels=2, hidden_dim=64): # Reduced base dim for Multi-Scale
+    def __init__(self, input_channels=1, hidden_dim=64):
         super().__init__()
         
-        self.conv_in = spectral_norm(nn.Conv2d(input_channels, hidden_dim, kernel_size=4, stride=2, padding=1))
+        # Helper to apply SN to ComplexConv2d
+        def complex_sn(layer):
+            layer = spectral_norm(layer, name='weight_real')
+            layer = spectral_norm(layer, name='weight_imag')
+            return layer
+
+        self.conv_in = complex_sn(ComplexConv2d(input_channels, hidden_dim, kernel_size=4, stride=2, padding=1))
         
         self.blocks = nn.ModuleList([
             nn.Sequential(
-                spectral_norm(nn.Conv2d(hidden_dim, hidden_dim * 2, kernel_size=4, stride=2, padding=1)),
-                nn.LeakyReLU(0.2, inplace=True),
+                complex_sn(ComplexConv2d(hidden_dim, hidden_dim * 2, kernel_size=4, stride=2, padding=1)),
+                ComplexReLU(),
             ),
-            nn.Sequential(
-                spectral_norm(nn.Conv2d(hidden_dim * 2, hidden_dim * 4, kernel_size=4, stride=2, padding=1)),
-                nn.LeakyReLU(0.2, inplace=True),
-            ),
-            nn.Sequential(
-                spectral_norm(nn.Conv2d(hidden_dim * 4, hidden_dim * 8, kernel_size=4, stride=2, padding=1)),
-                nn.LeakyReLU(0.2, inplace=True),
-            ),
-             nn.Sequential(
-                spectral_norm(nn.Conv2d(hidden_dim * 8, hidden_dim * 16, kernel_size=4, stride=2, padding=1)),
-                nn.LeakyReLU(0.2, inplace=True),
-            ),
+            # Removed the 2nd block to weaken the discriminator
+            # nn.Sequential(
+            #     complex_sn(ComplexConv2d(hidden_dim * 2, hidden_dim * 4, kernel_size=4, stride=2, padding=1)),
+            #     ComplexReLU(),
+            # ),
+            # nn.Sequential(
+            #     complex_sn(ComplexConv2d(hidden_dim * 4, hidden_dim * 8, kernel_size=4, stride=2, padding=1)),
+            #     ComplexReLU(),
+            # ),
         ])
         
-        self.conv_out = spectral_norm(nn.Conv2d(hidden_dim * 16, 1, kernel_size=4, stride=1, padding=1))
+        # Reduced output channel depth to match the removed block (hidden_dim * 2)
+        # Restore Spectral Norm to stabilize output range and prevent exploding gradients
+        self.conv_out = complex_sn(ComplexConv2d(hidden_dim * 2, 1, kernel_size=3, stride=1, padding=1))
 
-    def forward(self, x):
-        # Input: [B, 2, F, T]
+    def forward(self, x_real, x_imag):
+        # Input: [B, C, F, T]
         features = []
         
-        x = self.conv_in(x)
-        x = F.leaky_relu(x, 0.2)
-        features.append(x)
+        x_real, x_imag = self.conv_in(x_real, x_imag)
+        x_real, x_imag = ComplexReLU()(x_real, x_imag) # Leaky ReLU equivalent? ComplexReLU masks.
+        # Standard ComplexReLU is like ReLU. For D we usually want LeakyReLU.
+        # But ComplexLeakyReLU is tricky. 
+        # User said "Reference G's implementation". G uses ComplexReLU.
+        # I will use ComplexReLU.
+        
+        features.append((x_real, x_imag))
         
         for block in self.blocks:
-            x = block(x)
-            features.append(x)
+            for layer in block:
+                if isinstance(layer, ComplexConv2d):
+                    x_real, x_imag = layer(x_real, x_imag)
+                else:
+                    x_real, x_imag = layer(x_real, x_imag)
+            features.append((x_real, x_imag))
             
-        x = self.conv_out(x)
-        features.append(x)
+        x_real, x_imag = self.conv_out(x_real, x_imag)
+        features.append((x_real, x_imag))
         
-        return x, features
+        # Return Real part as score (Hermitian projection concept)
+        return x_real, features
 
-class Discriminator(nn.Module):
+class ComplexMultiScaleDiscriminator(nn.Module):
     """
-    Multi-Scale Discriminator (3 scales)
+    Multi-Scale Complex Discriminator.
+    Consists of 3 ComplexSingleScaleDiscriminators operating on:
+    1. Original Resolution
+    2. x2 Downsampled
+    3. x4 Downsampled
     """
-    def __init__(self, input_channels=2, hidden_dim=64):
+    def __init__(self, input_channels=1, hidden_dim=64, n_scales=3):
         super().__init__()
         self.discriminators = nn.ModuleList([
-            SingleScaleDiscriminator(input_channels, hidden_dim),
-            SingleScaleDiscriminator(input_channels, hidden_dim),
-            SingleScaleDiscriminator(input_channels, hidden_dim)
+            ComplexSingleScaleDiscriminator(input_channels, hidden_dim) for _ in range(n_scales)
         ])
-        
+        # Average Pooling for downsampling (preserves complex structure linearly)
         self.downsample = nn.AvgPool2d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
 
-    def forward(self, real, imag, mag=None):
-        # Input: [B, T, F]
-        # Treat Freq as Height (H), Time as Width (W).
-        # We want [B, C, H, W] = [B, 2, F, T] (or 3 if mag provided)
-        
-        if real.dim() == 3:
-            # [B, T, F] -> [B, F, T]
-            real = real.permute(0, 2, 1)
-            imag = imag.permute(0, 2, 1)
-            if mag is not None:
-                mag = mag.permute(0, 2, 1)
-        
-        # Stack to [B, C, F, T]
-        if mag is not None:
-            x = torch.stack([real, imag, mag], dim=1)
-        else:
-            x = torch.stack([real, imag], dim=1)
-        
+    def forward(self, x_real, x_imag):
+        # x_real, x_imag: [B, C, F, T]
         outputs = []
-        features_list = []
+        features = []
+        
         for i, d in enumerate(self.discriminators):
             if i > 0:
-                x = self.downsample(x)
+                x_real = self.downsample(x_real)
+                x_imag = self.downsample(x_imag)
+            
+            score, feats = d(x_real, x_imag)
+            outputs.append(score)
+            features.append(feats)
+            
+        return outputs, features
+
+class DiscriminatorR(nn.Module):
+    """
+    STFT-based Discriminator (Resolution Discriminator).
+    Operates on (Real, Imag) of STFT.
+    """
+    def __init__(self, n_fft, hop_length, win_length, use_spectral_norm=False):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        
+        norm_f = spectral_norm if use_spectral_norm else weight_norm
+        
+        self.convs = nn.ModuleList([
+            norm_f(nn.Conv2d(2, 16, kernel_size=(3, 9), padding=(1, 4))),
+            norm_f(nn.Conv2d(16, 16, kernel_size=(3, 9), stride=(1, 2), padding=(1, 4))),
+            norm_f(nn.Conv2d(16, 16, kernel_size=(3, 9), stride=(1, 2), padding=(1, 4))),
+            norm_f(nn.Conv2d(16, 16, kernel_size=(3, 9), stride=(1, 2), padding=(1, 4))),
+            norm_f(nn.Conv2d(16, 16, kernel_size=(3, 3), padding=(1, 1))),
+        ])
+        self.conv_post = norm_f(nn.Conv2d(16, 1, kernel_size=(3, 3), padding=(1, 1)))
+
+    def forward(self, x):
+        # x: [B, 1, T]
+        # STFT
+        x_stft = torch.stft(x.squeeze(1), self.n_fft, self.hop_length, self.win_length, 
+                            window=torch.hann_window(self.win_length, device=x.device),
+                            return_complex=True)
+        # x_stft: [B, F, T] (Complex)
+        
+        # Concat Real/Imag: [B, 2, F, T]
+        # Need to permute F and T for Conv2d? Conv2d is (B, C, H, W).
+        # Usually H=Freq, W=Time.
+        # x_stft is (B, F, T).
+        # We want (B, 2, F, T).
+        
+        x_in = torch.cat([x_stft.real.unsqueeze(1), x_stft.imag.unsqueeze(1)], dim=1)
+        
+        fmap = []
+        for l in self.convs:
+            x_in = l(x_in)
+            x_in = F.leaky_relu(x_in, 0.1)
+            fmap.append(x_in)
+        
+        x_in = self.conv_post(x_in)
+        fmap.append(x_in)
+        x_in = torch.flatten(x_in, 1, -1)
+        
+        return x_in, fmap
+
+class MultiResolutionDiscriminator(nn.Module):
+    def __init__(self, use_spectral_norm=False):
+        super().__init__()
+        # Resolutions: (n_fft, hop_length, win_length)
+        # Reduced resolutions to save memory (Removed 1024)
+        self.resolutions = [
+            (512, 50, 240),
+            (256, 30, 120),
+            (128, 15, 60)
+        ]
+        
+        self.discriminators = nn.ModuleList([
+            DiscriminatorR(n_fft, hop, win, use_spectral_norm=use_spectral_norm)
+            for (n_fft, hop, win) in self.resolutions
+        ])
+
+    def forward(self, x):
+        outputs = []
+        features = []
+        for d in self.discriminators:
+            score, feats = d(x)
+            outputs.append(score)
+            features.append(feats)
+        return outputs, features
+
+class Discriminator(nn.Module):
+    # Deprecated: Kept alias for compatibility if needed, but we will switch CombinedDiscriminator to use MRD.
+    def __init__(self, input_channels=1, hidden_dim=64):
+        super().__init__()
+        self.mrd = MultiResolutionDiscriminator()
+    def forward(self, x):
+        return self.mrd(x)
+
+class DiscriminatorP(nn.Module):
+    """
+    Period Discriminator (MPD) from HiFi-GAN.
+    Operates on raw waveform by reshaping 1D -> 2D with specific period.
+    """
+    def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False, channel_multiplier=1.0):
+        super(DiscriminatorP, self).__init__()
+        self.period = period
+        self.use_spectral_norm = use_spectral_norm
+        norm_f = spectral_norm if use_spectral_norm else weight_norm
+        
+        # Reduced channels by default if channel_multiplier < 1
+        ch = lambda x: int(x * channel_multiplier)
+        
+        self.convs = nn.ModuleList([
+            norm_f(nn.Conv2d(1, ch(32), (kernel_size, 1), (stride, 1), padding=(2, 0))),
+            norm_f(nn.Conv2d(ch(32), ch(128), (kernel_size, 1), (stride, 1), padding=(2, 0))),
+            norm_f(nn.Conv2d(ch(128), ch(512), (kernel_size, 1), (stride, 1), padding=(2, 0))),
+            norm_f(nn.Conv2d(ch(512), ch(1024), (kernel_size, 1), (stride, 1), padding=(2, 0))),
+            norm_f(nn.Conv2d(ch(1024), ch(1024), (kernel_size, 1), 1, padding=(2, 0))),
+        ])
+        self.conv_post = norm_f(nn.Conv2d(ch(1024), 1, (3, 1), 1, padding=(1, 0)))
+
+    def forward(self, x):
+        fmap = []
+
+        # 1d to 2d
+        b, c, t = x.shape
+        if t % self.period != 0: # pad first
+            n_pad = self.period - (t % self.period)
+            x = F.pad(x, (0, n_pad), "reflect")
+            t = t + n_pad
+        x = x.view(b, c, t // self.period, self.period)
+
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, 0.1)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+        
+        return x, fmap
+
+class MultiPeriodDiscriminator(nn.Module):
+    """
+    Multi-Period Discriminator (MPD) container.
+    """
+    def __init__(self, use_spectral_norm=False):
+        super(MultiPeriodDiscriminator, self).__init__()
+        # Standard HiFi-GAN periods are [2, 3, 5, 7, 11]
+        # Reduced to [2, 3, 5, 7, 11] but with 0.5x channels to save memory
+        # Or reduce periods to [3, 7, 11]
+        self.periods = [3, 7, 11] # Reduced number of periods
+        
+        # Use 0.25x channels to prevent overpowering G and save memory
+        self.discriminators = nn.ModuleList([
+            DiscriminatorP(p, use_spectral_norm=use_spectral_norm, channel_multiplier=0.25) for p in self.periods
+        ])
+
+    def forward(self, x):
+        # x: [B, 1, T]
+        outputs = []
+        features_list = []
+        for d in self.discriminators:
             score, feats = d(x)
             outputs.append(score)
             features_list.append(feats)
-            
         return outputs, features_list
 
+class CombinedDiscriminator(nn.Module):
+    """
+    Combines Spectral Discriminator (MRD) and Waveform Discriminator (MPD).
+    Provides orthogonal views for GAN training.
+    """
+    def __init__(self, input_channels=1, hidden_dim=64):
+        super().__init__()
+        # 1. Spectral Discriminator (New - MRD)
+        self.spectral_discriminator = MultiResolutionDiscriminator()
+        
+        # 2. Waveform Discriminator (MPD)
+        self.waveform_discriminator = MultiPeriodDiscriminator()
+
+    def forward(self, waveform):
+        """
+        waveform: Raw Waveform [B, 1, T]
+        """
+        # Ensure waveform is [B, 1, T]
+        if waveform.dim() == 2:
+            waveform = waveform.unsqueeze(1)
+
+        # 1. Spectral Branch (MRD takes waveform)
+        spec_scores, spec_feats = self.spectral_discriminator(waveform)
+        
+        # 2. Waveform Branch
+        wave_scores, wave_feats = self.waveform_discriminator(waveform)
+            
+        # Combine results
+        return spec_scores + wave_scores, spec_feats + wave_feats
+
 class AudioCodec(nn.Module):
-    def __init__(self, sr=16000, freqs=None, frame_ms=32.0, hop_ms=8.0, 
-                 hidden_dim=512, latent_dim=1536, n_codebook=4096, n_quantizers=8, causal=False,
+    def __init__(self, sr=16000, freqs=None, frame_ms=32.0, hop_ms=10.0, 
+                 hidden_dim=512, latent_dim=256, n_codebook=None, n_quantizers=16, causal=False,
                  quantizer_weights=None):
         super().__init__()
         self.sr = sr
         self.register_buffer("freqs", freqs)
         self.frame_ms = frame_ms
         self.hop_ms = hop_ms
-        # With hop_ms=8.0ms -> 125Hz STFT
-        # Encoder Downsample x2 -> 62.5Hz Tokens
+        # With hop_ms=10.0ms -> 100Hz STFT
+        # Encoder Downsample x4 -> 25Hz Tokens
         self.causal = causal
         
         # RVQ Weights
         if quantizer_weights is None:
-            # Default: Uniform weights
-            quantizer_weights = [1.0] * n_quantizers
+            # Default: Decaying weights (0.8^i) to encourage early layers, consistent with training
+            quantizer_weights = [1.0 * (0.8 ** i) for i in range(n_quantizers)]
         assert len(quantizer_weights) == n_quantizers, "quantizer_weights must match n_quantizers"
         self.register_buffer("quantizer_weights", torch.tensor(quantizer_weights, dtype=torch.float32))
+
+        # Default Codebook Sizes (Descending)
+        if n_codebook is None:
+            if n_quantizers == 16:
+                n_codebook = [1024, 1024, 512, 512, 256, 256, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
+            elif n_quantizers == 8:
+                n_codebook = [1024, 1024, 512, 512, 256, 256, 128, 128]
+            else:
+                n_codebook = 1024 # Fallback to uniform 1024 if not 8 layers
         
         num_freqs = freqs.numel()
         # Input channels for Complex Conv is num_freqs (Real part) + num_freqs (Imag part)
@@ -636,24 +863,35 @@ class AudioCodec(nn.Module):
         
         self.decoder = ComplexDecoder(latent_dim, hidden_dim, num_freqs, causal=causal)
 
-    def forward(self, frames):
+    def forward(self, frames, quantize=True):
         """
         frames: [B, T, Frame_Len]
+        quantize: Whether to use VQ or pass continuous latents (with Tanh)
         """
         spec_vector = frame2vector(frames, self.sr, self.freqs) # [B, T, F] Complex
         
         # --- Power-Law Compression (Alpha=0.3) ---
         # Helps with High Freq reconstruction by compressing dynamic range
         # X_compressed = |X|^0.3 * exp(j * angle(X))
-        mag = torch.abs(spec_vector)
-        phase = torch.angle(spec_vector)
-        # Avoid zero division or nan
-        mag = torch.clamp(mag, min=1e-7)
-        mag_compressed = torch.pow(mag, 0.3)
-        spec_compressed = torch.polar(mag_compressed, phase)
+        # Use Algebraic Scaling to avoid NaN gradients in atan2/polar
+        # z_c = z * |z|^(alpha-1)
         
-        real = spec_compressed.real
-        imag = spec_compressed.imag
+        mag_sq = spec_vector.real**2 + spec_vector.imag**2
+        mag = torch.sqrt(mag_sq + 1e-5) # eps=1e-5 for safety
+        
+        # scale = mag^(0.3 - 1) = mag^(-0.7)
+        # Avoid division by zero
+        scale = torch.pow(mag, 0.3 - 1.0)
+        # If mag is very small, scale becomes huge. 
+        # But z is small. z * scale -> 0 * inf = NaN.
+        # Better: scale = mag^0.3 / mag
+        # z_c = z * (mag^0.3 / (mag + eps))
+        
+        mag_compressed = torch.pow(mag, 0.3)
+        scale_safe = mag_compressed / (mag + 1e-6)
+        
+        real = spec_vector.real * scale_safe
+        imag = spec_vector.imag * scale_safe
         
         # Prepare for Conv1d: [B, F, T]
         real_in = real.permute(0, 2, 1)
@@ -665,13 +903,24 @@ class AudioCodec(nn.Module):
         # Flatten for Quantization
         z = torch.cat([z_real, z_imag], dim=1) # [B, 2*Latent, T']
         
-        # Quantize
-        z_q, all_losses, codes = self.quantizer(z)
-        
-        # Compute Weighted Commitment Loss
-        commit_loss = 0.0
-        for i, loss in enumerate(all_losses):
-            commit_loss += loss * self.quantizer_weights[i]
+        if quantize:
+            # Quantize
+            # Continuous Training Mode used Tanh, so we must apply Tanh here too
+            # to match the distribution of the embeddings trained with Tanh-clamped inputs.
+            # z = torch.tanh(z)
+            z_q, all_losses, codes = self.quantizer(z)
+            
+            # Compute Weighted Commitment Loss
+            commit_loss = 0.0
+            for i, loss in enumerate(all_losses):
+                commit_loss += loss * self.quantizer_weights[i]
+        else:
+            # Continuous Training Mode
+            # Apply Tanh to constrain latent space to [-1, 1] for future clustering
+            z_q = torch.tanh(z)
+            commit_loss = torch.tensor(0.0, device=z.device)
+            codes = None
+            all_losses = []
         
         # Unflatten
         z_q_real, z_q_imag = torch.chunk(z_q, 2, dim=1)
@@ -685,22 +934,22 @@ class AudioCodec(nn.Module):
         
         # --- Inverse Power-Law Compression ---
         # X_recon = |X_hat|^(1/0.3) * exp(j * angle(X_hat))
-        spec_hat_compressed = torch.complex(real_hat, imag_hat)
-        mag_hat_compressed = torch.abs(spec_hat_compressed)
-        phase_hat = torch.angle(spec_hat_compressed)
+        # Algebraic: z = z_c * |z_c|^(1/alpha - 1)
         
-        # Safety: Clamp compressed magnitude to avoid explosion during inverse power (x^3.33)
-        # 50^3.33 is ~450,000, which is large but safe for float32. 
-        # 100^3.33 is ~4.6 million.
-        # If the model outputs garbage > 100, we get explosion.
+        mag_sq_hat = real_hat**2 + imag_hat**2
+        mag_hat_compressed = torch.sqrt(mag_sq_hat + 1e-5)
+        
+        # Safety clamp to prevent explosion
         mag_hat_compressed = torch.clamp(mag_hat_compressed, max=50.0)
         
-        mag_hat = torch.pow(mag_hat_compressed, 1.0/0.3)
-        # Re-construct complex
-        spec_hat = torch.polar(mag_hat, phase_hat)
+        # scale_inv = mag_hat^(1/0.3 - 1) = mag_hat^(2.33)
+        inv_alpha = 1.0 / 0.3
+        scale_inv = torch.pow(mag_hat_compressed, inv_alpha - 1.0)
         
-        real_hat = spec_hat.real
-        imag_hat = spec_hat.imag
+        # spec_hat = z_hat * scale_inv
+        real_hat_decomp = real_hat * scale_inv
+        imag_hat_decomp = imag_hat * scale_inv
+
         
         # Note: We return both the "compressed" output (for latent loss?) 
         # No, usually we compute loss on the final decompressed output.
@@ -714,22 +963,29 @@ class AudioCodec(nn.Module):
             min_len = min(real_hat.shape[1], spec_vector.shape[1])
             real_hat = real_hat[:, :min_len, :]
             imag_hat = imag_hat[:, :min_len, :]
-            # real = real[:, :min_len, :] # This is compressed
-            # imag = imag[:, :min_len, :] # This is compressed
+            real_hat_decomp = real_hat_decomp[:, :min_len, :]
+            imag_hat_decomp = imag_hat_decomp[:, :min_len, :]
             
-            # Update spec_vector crop too for consistency in return
-            # spec_vector = spec_vector[:, :min_len, :]
+            # Crop targets (Compressed)
+            real = real[:, :min_len, :]
+            imag = imag[:, :min_len, :]
+            
+            # Crop targets (Uncompressed) - For completeness if needed, though we use compressed for loss
+            spec_vector = spec_vector[:, :min_len, :]
             
             # Actually, let's just crop outputs.
         
-        frames_hat = vector2frame(real_hat, imag_hat, self.sr, self.freqs, frames.shape[-1])
+        # Use DECOMPRESSED spectrum for waveform reconstruction
+        frames_hat = vector2frame(real_hat_decomp, imag_hat_decomp, self.sr, self.freqs, frames.shape[-1])
         
         return {
             "frames_hat": frames_hat,
-            "real_hat": real_hat,
-            "imag_hat": imag_hat,
-            "real": spec_vector.real, # Return UNCOMPRESSED original for Loss
-            "imag": spec_vector.imag, # Return UNCOMPRESSED original for Loss
+            "real_hat": real_hat,         # Compressed Prediction
+            "imag_hat": imag_hat,         # Compressed Prediction
+            "real": real,                 # Compressed Target
+            "imag": imag,                 # Compressed Target
+            "real_raw": spec_vector.real, # Uncompressed Target (Optional)
+            "imag_raw": spec_vector.imag, # Uncompressed Target (Optional)
             "commit_loss": commit_loss,
             "codes": codes
         }
@@ -740,6 +996,12 @@ class AudioCodec(nn.Module):
         codes: [B, T, N_quantizers]
         """
         # Get quantized latents
+        # IMPORTANT: The model was trained with Tanh output from encoder.
+        # But here we are decoding from codes which are embeddings.
+        # The embeddings were learned to match Tanh(z).
+        # So the embeddings themselves already represent values in range [-1, 1].
+        # We don't need to apply Tanh here.
+        
         z_q = self.quantizer.from_codes(codes) # [B, 2*Latent, T]
         
         # Unflatten
@@ -752,9 +1014,26 @@ class AudioCodec(nn.Module):
         real_hat = x_hat_real.permute(0, 2, 1) # [B, T, F]
         imag_hat = x_hat_imag.permute(0, 2, 1)
         
+        # --- Inverse Power-Law Compression ---
+        # Same as in forward()
+        
+        mag_sq_hat = real_hat**2 + imag_hat**2
+        mag_hat_compressed = torch.sqrt(mag_sq_hat + 1e-5)
+        mag_hat_compressed = torch.clamp(mag_hat_compressed, max=50.0)
+        
+        inv_alpha = 1.0 / 0.3
+        scale_inv = torch.pow(mag_hat_compressed, inv_alpha - 1.0)
+        
+        real_hat_decomp = real_hat * scale_inv
+        imag_hat_decomp = imag_hat * scale_inv
+        
         # We can estimate frame_len from sr and frame_ms.
         frame_len = int(self.sr * self.frame_ms / 1000)
         
-        frames_hat = vector2frame(real_hat, imag_hat, self.sr, self.freqs, frame_len)
+        # Use DECOMPRESSED spectrum
+        # Ensure we pass the correct frame length for the given model config
+        # If the input was padded, this frame_len might be slightly off if not careful,
+        # but typically it's fixed by frame_ms.
+        frames_hat = vector2frame(real_hat_decomp, imag_hat_decomp, self.sr, self.freqs, frame_len)
         
         return frames_hat

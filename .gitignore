@@ -6,9 +6,13 @@ __pycache__/
 # Models and Checkpoints
 *.pt
 *.pth
+*.safetensors
+*.bin
+*.pkl
 checkpoints/
 checkpoints_codec/
 checkpoints_codec_gan/
+checkpoints*/
 out6/
 out7/
 overfit_results_v4/
@@ -23,5 +27,17 @@ dummy_sharded_dataset/
 # Output Audio
 *.wav
 
+# Logs
+*.log
+
 # System
 .DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual Env
+venv/
+.venv/
+env/

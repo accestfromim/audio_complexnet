@@ -7,10 +7,10 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from datasets import DatasetDict
 import os
 
-from AudioComplexNet.modeling_audio_codec import AudioCodec, Discriminator
+from AudioComplexNet.modeling_audio_codec import AudioCodec, CombinedDiscriminator
 from AudioComplexNet.utils import overlap_add
 from AudioComplexNet.losses import MultiScaleSTFTLoss
-from AudioComplexNet.metrics import compute_metrics_batch, calculate_sisdr
+from AudioComplexNet.metrics import compute_metrics_batch, calculate_sisdr, calculate_pesq, calculate_stoi
 from prepare import dataset, collator, custom_freqs
 
 # Modify collator to not truncate
@@ -56,64 +56,21 @@ def feature_matching_loss(fmap_r, fmap_g):
     loss = 0
     for dr, dg in zip(fmap_r, fmap_g):
         for rl, gl in zip(dr, dg):
-            loss += torch.mean(torch.abs(rl - gl))
+            # Check if rl/gl are tuples (Complex Features: (real, imag))
+            if isinstance(rl, (tuple, list)):
+                rl_real, rl_imag = rl
+                gl_real, gl_imag = gl
+                # Detach targets (real) to ensure no gradient flow back to D and save memory
+                loss += torch.mean(torch.abs(rl_real.detach() - gl_real) + torch.abs(rl_imag.detach() - gl_imag))
+            # Check if standard Complex Tensor
+            elif torch.is_complex(rl):
+                loss += torch.mean(torch.abs(rl.real.detach() - gl.real) + torch.abs(rl.imag.detach() - gl.imag))
+            else:
+                loss += torch.mean(torch.abs(rl.detach() - gl))
     
     # Normalize by number of layers to keep scale consistent regardless of depth
     num_layers = sum(len(d) for d in fmap_r)
     return loss / (num_layers + 1e-7)
-
-def power_law_compress(real, imag, alpha=0.3, eps=1e-5):
-    """
-    Compress complex spectrogram for Discriminator stability.
-    Returns: (real_c, imag_c, mag_c)
-    """
-    # Safety: Clamp inputs to prevent extreme values causing instability
-    real = torch.clamp(real, min=-1e5, max=1e5)
-    imag = torch.clamp(imag, min=-1e5, max=1e5)
-
-    mag = torch.sqrt(real**2 + imag**2 + eps)
-    # Clamp mag to avoid gradient explosion in pow(mag, alpha) when mag -> 0
-    mag = torch.clamp(mag, min=eps) 
-    phase = torch.atan2(imag, real)
-    
-    mag_c = torch.pow(mag, alpha)
-    real_c = mag_c * torch.cos(phase)
-    imag_c = mag_c * torch.sin(phase)
-    
-    # Safety: Replace NaNs if any generated (though unlikely with clamp)
-    if torch.isnan(real_c).any() or torch.isnan(imag_c).any():
-        real_c = torch.nan_to_num(real_c)
-        imag_c = torch.nan_to_num(imag_c)
-        mag_c = torch.nan_to_num(mag_c)
-    
-    return real_c, imag_c, mag_c
-
-def spectral_loss(x_hat_real, x_hat_imag, x_real, x_imag, eps=1e-5):
-    # Force FP32
-    x_hat_real = x_hat_real.float()
-    x_hat_imag = x_hat_imag.float()
-    x_real = x_real.float()
-    x_imag = x_imag.float()
-
-    mag_hat = torch.sqrt(x_hat_real**2 + x_hat_imag**2 + eps)
-    mag_real = torch.sqrt(x_real**2 + x_imag**2 + eps)
-    
-    # Log Magnitude Loss (Critical for audio dynamic range)
-    # Clamp before log for extra safety
-    mag_hat = torch.clamp(mag_hat, min=eps)
-    mag_real = torch.clamp(mag_real, min=eps)
-    
-    log_mag_hat = torch.log(mag_hat)
-    log_mag_real = torch.log(mag_real)
-    loss_log_mag = F.l1_loss(log_mag_hat, log_mag_real)
-    
-    # Linear Magnitude Loss
-    loss_mag = F.l1_loss(mag_hat, mag_real)
-    
-    # Complex L1 (Already in main loop, but good to have here conceptually)
-    # loss_complex = F.l1_loss(x_hat_real, x_real) + F.l1_loss(x_hat_imag, x_imag)
-    
-    return loss_log_mag, loss_mag
 
 def main():
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -123,40 +80,40 @@ def main():
     # Config
     sr = 16000
     frame_ms = 32.0
-    hop_ms = 8.0 # 125Hz STFT (128 samples) -> 62.5Hz Tokens (Perfect Alignment)
+    hop_ms = 10.0 # 100Hz STFT -> 25Hz Tokens
     freqs = custom_freqs.to(device)
     
-    # Loss weights (Pure GAN Fine-tuning Strategy)
-    # Rationale: Audio GANs (like HiFi-GAN) require very strong reconstruction weights 
-    # to balance the gradients, as L1 Loss on spectrograms is numerically small (~0.02-0.05).
-    # Standard HiFi-GAN config: Mel=45.0, Feat=2.0. 
-    # We use slightly higher weights here to stabilize the previous exploding loss.
-    W_ADV = 1.0       # Primary Driver
-    W_FEAT = 10.0     # Feature Matching
-    W_MEL = 5.0       # Reduced from 45.0 to 5.0 to prevent Gradient Explosion and Clipping dominance
-    W_MAG = 0.0      # Replaced by Mel Spectrogram Loss
-    W_LOG_MAG = 1.0   # Multi-Scale Log-Mag L1
-    W_COMPLEX = 0.0   # Redundant with SI-SDR and MS-STFT, removed to reduce conflict
-    W_TIME = 0.0      # Redundant with SI-SDR, removed to prevent L1 blurring
-    W_COMMIT = 0.1    # Restored: Z detached in model, so this only updates Codebook now
-    W_SISDR = 0.0     # Disable SISDR to prevent High Grad Norm and instability
+    # Loss weights (Stable GAN Strategy)
+    W_ADV = 1.0      # GAN Loss
+    W_FEAT = 2.0    # Feature Matching (Increased to 10.0 for better stability)
+    W_MEL = 10.0     # Strong Mel Loss (Increased to 45.0 for better spectral quality/PESQ)
+    W_MAG = 0.0      # Enable Linear Mag (Fix Spectral Convergence Error)
+    W_LOG_MAG = 0.0  # Enable Log Mag (Fix Spectral Convergence Error)
+    W_COMPLEX = 0.0  
+    W_TIME = 0.0     
+    W_COMMIT = 5.0  # Enable Codebook Learning
+    W_SISDR = 1.0    # Disable SI-SDR for GAN training (Conflicts with Adversarial Phase)
 
     # Resume & Save Config
-    # TODO: Modify these paths to your actual checkpoint paths
-    resume_g_checkpoint = "./checkpoints_codec/epoch_40/codec_modelbkup.pth" 
-    #resume_g_checkpoint = None
-    resume_d_checkpoint = None # Start D from scratch
+    resume_g_checkpoint = "checkpoints_codec_new_arch_warmup_just_SISDR_20_quantizers_stage2_gan_again/epoch_33/codec_model.pth"
+    resume_d_checkpoint = "checkpoints_codec_new_arch_warmup_just_SISDR_20_quantizers_stage2_gan_again/epoch_33/discriminator_model.pth"#"checkpoints_codec_new_arch_warmup_just_SISDR_20_quantizers_stage2/epoch_32/discriminator_model.pth"
     
-    save_dir_base = "checkpoints_codec_gan" # Save to a new directory
+    save_dir_base = "checkpoints_codec_new_arch_warmup_just_SISDR_20_quantizers_stage3_gan"
     
     # Pretrain D Config
-    PRETRAIN_D_EPOCHS = 1 # Restore D pretraining as system proves resilient (Acc recovers to ~77%)
+    PRETRAIN_D_EPOCHS = 0
+    
+    # D Update Interval (Weaken D by updating less frequently)
+    D_UPDATE_INTERVAL = 1
     
     # RVQ Layer Weights (Decaying to encourage early layers)
     # User requested different weights for different layers
-    n_quantizers = 8
+    n_quantizers = 20
     quantizer_weights = [1.0 * (0.8 ** i) for i in range(n_quantizers)]
-    # quantizer_weights = [1.0, 0.8, 0.64, 0.51, 0.41, 0.33, 0.26, 0.21]
+    
+    # Codebook sizes (Descending: Larger capacity for early layers, smaller for residuals)
+    # 1024, 1024, 512, 512, 256, 256, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 32, 32, 32, 32
+    n_codebook = [1024, 1024, 512, 512, 256, 256, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 32, 32, 32, 32]
     
     # Model
     model = AudioCodec(
@@ -165,19 +122,25 @@ def main():
         frame_ms=frame_ms, 
         hop_ms=hop_ms, 
         n_quantizers=n_quantizers,
+        n_codebook=n_codebook,
         quantizer_weights=quantizer_weights
     )
-    discriminator = Discriminator(input_channels=3) # Changed to 3 for Real+Imag+Mag
+    
+    ENABLE_GAN = True # Set to True to enable Discriminator training
+    
+    if ENABLE_GAN:
+        discriminator = CombinedDiscriminator()
+    else:
+        discriminator = None
     
     # Freeze Encoder Config
-    FREEZE_ENCODER = False # Changed to False to prevent NaN issues with broken gradient chains
+    FREEZE_ENCODER = True # Changed to False for Full Training to improve metrics
     
     # Optimizers
-    lr_g = 2e-5 # Decreased G LR for fine-tuning stability
-    lr_d = 2e-5 # Balanced D LR with G
+    lr_g = 2e-4 # Increased back to standard 2e-4 now that we have stability fixes
+    lr_d = 2e-4 # Increased to standard HiFi-GAN value (was 5e-5) to help D learn Real distribution faster
     
-    # Soft Freeze Strategy: Set Encoder LR to 0.0 instead of requires_grad=False
-    # This keeps the computation graph intact but prevents updates.
+    # Train Full Model
     
     encoder_params = []
     decoder_params = []
@@ -187,34 +150,75 @@ def main():
         else:
             decoder_params.append(param)
             
-    opt_g = AdamW([
-        {"params": encoder_params, "lr": 0.0}, # Freeze Encoder
-        {"params": decoder_params, "lr": lr_g} # Train Decoder/Quantizer
-    ], betas=(0.5, 0.9))
-    opt_d = AdamW(discriminator.parameters(), lr=lr_d, betas=(0.5, 0.9), weight_decay=1e-4) # Weight decay to prevent D explosion
+    if FREEZE_ENCODER:
+        # Freeze Encoder Parameters
+        for p in encoder_params:
+            p.requires_grad = False
+            
+        opt_g = AdamW([
+            # {"params": encoder_params, "lr": lr_g}, # Train Encoder
+            {"params": decoder_params, "lr": lr_g} # Train Decoder/Quantizer
+        ], betas=(0.5, 0.9))
+    else:
+        opt_g = AdamW([
+            {"params": encoder_params, "lr": lr_g}, # Train Encoder
+            {"params": decoder_params, "lr": lr_g} # Train Decoder/Quantizer
+        ], betas=(0.5, 0.9))
+    
+    num_epochs = 80
+
+    if ENABLE_GAN:
+        opt_d = AdamW(discriminator.parameters(), lr=lr_d, betas=(0.5, 0.9), weight_decay=1e-4)
+        sched_d = CosineAnnealingLR(opt_d, T_max=num_epochs, eta_min=1e-6)
+    else:
+        opt_d = None
+        sched_d = None
 
     # Scheduler
-    num_epochs = 40
     sched_g = CosineAnnealingLR(opt_g, T_max=num_epochs, eta_min=1e-6)
-    sched_d = CosineAnnealingLR(opt_d, T_max=num_epochs, eta_min=1e-6)
+    # sched_d handled above
 
     # Data
     train_dataset = get_train_dataset()
     val_dataset = get_validation_dataset()
     
-    # Batch size 4 per GPU
-    batch_size = 4
+    # Batch size 5 per GPU -> Global Batch Size = 25
+    batch_size = 3
     
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collator)
+    # Optimize Data Loading for Multi-GPU
+    # num_workers per GPU. 5 GPUs * 4 workers = 20 workers total (ensure CPU has enough cores)
+    # pin_memory speeds up host-to-device transfer
+    train_dataloader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=collator, 
+        num_workers=4, 
+        pin_memory=True,
+        persistent_workers=True
+    )
     if val_dataset:
-        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collator)
+        val_dataloader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            collate_fn=collator, 
+            num_workers=4, 
+            pin_memory=True,
+            persistent_workers=True
+        )
     else:
         val_dataloader = None
 
     # Prepare
-    model, discriminator, opt_g, opt_d, train_dataloader, val_dataloader, sched_g, sched_d = accelerator.prepare(
-        model, discriminator, opt_g, opt_d, train_dataloader, val_dataloader, sched_g, sched_d
-    )
+    if ENABLE_GAN:
+        model, discriminator, opt_g, opt_d, train_dataloader, val_dataloader, sched_g, sched_d = accelerator.prepare(
+            model, discriminator, opt_g, opt_d, train_dataloader, val_dataloader, sched_g, sched_d
+        )
+    else:
+         model, opt_g, train_dataloader, val_dataloader, sched_g = accelerator.prepare(
+            model, opt_g, train_dataloader, val_dataloader, sched_g
+        )
     
     # Load Checkpoints (After prepare is usually safer for DDP, but before is fine for state_dict)
     # Here we load into the unwrapped model if possible, or wrapped.
@@ -229,7 +233,7 @@ def main():
         missing, unexpected = unwrapped_model.load_state_dict(state_dict, strict=False)
         print(f"Loaded G. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
         
-    if resume_d_checkpoint and os.path.exists(resume_d_checkpoint):
+    if ENABLE_GAN and resume_d_checkpoint and os.path.exists(resume_d_checkpoint):
         print(f"Loading Discriminator weights from {resume_d_checkpoint}")
         unwrapped_d = accelerator.unwrap_model(discriminator)
         state_dict = torch.load(resume_d_checkpoint, map_location=device)
@@ -241,7 +245,6 @@ def main():
     from AudioComplexNet.losses import MelSpectrogramLoss
     mel_loss_fn = MelSpectrogramLoss().to(device)
 
-    num_epochs = 40 # Train longer for Codec
     total_batches = len(train_dataloader)
     
     # CSV Logging Setup
@@ -256,8 +259,11 @@ def main():
                 writer = csv.writer(f)
                 writer.writerow(["Epoch", "Total_Loss", "Adv_Loss", "Mag_Loss", "LogMag_Loss", "Complex_Loss", "Time_Loss", "Commit_Loss", "PESQ", "STOI", "SI-SDR", "D_Real_Acc", "D_Fake_Acc"])
 
+    import gc
+
     for epoch in range(num_epochs):
-        discriminator.train()
+        if ENABLE_GAN:
+            discriminator.train()
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
         
@@ -283,190 +289,191 @@ def main():
                 p.requires_grad = False
         else:
             model.train()
-            # Optimize: Keep Encoder frozen (requires_grad=False) to save compute/memory
+            # Optimize: Train Everything (Except Encoder if Frozen)
             for name, p in model.named_parameters():
-                if "encoder" in name:
+                if FREEZE_ENCODER and "encoder" in name:
                     p.requires_grad = False
                 else:
                     p.requires_grad = True
         
         # Discriminator Update Frequency
-        D_UPDATE_INTERVAL = 1 # Train D every step (1:1) to fix D collapse
+        # Train D every 3 steps to balance training (Prevent D from overpowering G)
         last_d_loss = 0.0 # For logging continuity
         
         for batch_idx, batch in enumerate(train_dataloader, start=1):
             inputs = batch["inputs_features"] # [B, T, Frame_Len]
+            inputs_wav = batch["inputs_wav"].to(device).unsqueeze(1) # [B, 1, T_wav]
             
             # Sanity Check Inputs
             if torch.isnan(inputs).any() or torch.isinf(inputs).any():
                 print(f"CRITICAL: Input Batch {batch_idx} contains NaN/Inf. Skipping.")
                 continue
                 
-            # No targets needed, autoencoder
+            # Prepare Waveform Reconstruction Parameters
+            hop_length = int(sr * hop_ms / 1000)
+            frame_len = inputs.shape[-1]
+            window = torch.hann_window(frame_len).to(device)
             
-            # --- Train Discriminator ---
-            # Update D only every D_UPDATE_INTERVAL steps
-            should_update_d = (batch_idx % D_UPDATE_INTERVAL == 0)
+            # Helper to reconstruct waveform
+            def reconstruct_waveform(g_output, input_frames, hop_len, win):
+                # Reconstruct Pred Waveform
+                # Apply window to frames_hat to match wav_target's WOLA reconstruction (x * w^2)
+                # wav_target is derived from inputs * window, so it becomes inputs * window^2 after overlap_add
+                # So we must window frames_hat too.
+                wav_hat = overlap_add(g_output["frames_hat"] * win.view(1, 1, -1), hop_len, win)
+                
+                # Reconstruct Target Waveform (from input frames) - Kept for reference/debug, but we use RAW WAV now
+                # Inputs are RAW frames (unwindowed).
+                # We must window them first to get correct OLA reconstruction (Weighted OLA)
+                inputs_windowed = input_frames * win.unsqueeze(0).unsqueeze(0)
+                wav_target_wola = overlap_add(inputs_windowed, hop_len, win)
+                
+                return wav_hat, wav_target_wola
             
-            # Initialize d_loss with last known value for logging
+            # ---------------------
+            # Train Discriminator
+            # ---------------------
+            # Train D more frequently if needed, or based on interval
+            # Initialize d_loss for logging even if not updated
             d_loss = torch.tensor(last_d_loss, device=device)
             
-            if should_update_d:
+            if ENABLE_GAN and (batch_idx % D_UPDATE_INTERVAL == 0 or is_warmup):
                 opt_d.zero_grad()
                 
-                # Forward Generator (detach)
+                # Forward G (No Grad for G here)
                 with torch.no_grad():
-                    if is_warmup:
-                        model.eval() # Ensure eval mode during warmup
-                        g_out = model(inputs)
-                    else:
-                        g_out = model(inputs)
-                    # x_hat = torch.cat([g_out["real_hat"], g_out["imag_hat"]], dim=-1) # [B, T, 2F]
+                    g_out = model(inputs, quantize=True) # Always Quantize for GAN training
                     
-                    # Real x
-                    # x_real = torch.cat([g_out["real"], g_out["imag"]], dim=-1) # [B, T, 2F]
-                
-                # D Forward
-                # Note: Discriminator now returns (score, features) tuple
-                # Use Compressed Features for D Stability
-                
-                # Check for NaN in G output immediately
-                if torch.isnan(g_out["real_hat"]).any() or torch.isnan(g_out["imag_hat"]).any():
-                    print(f"CRITICAL: Generator produced NaN in output at batch {batch_idx}. Skipping Batch.")
-                    # We must skip D update and G update for this batch
-                    continue
+                    # Reconstruct Waveform
+                    wav_hat = overlap_add(g_out["frames_hat"] * window.view(1, 1, -1), hop_length, window)
                     
-                fake_r, fake_i, fake_m = power_law_compress(g_out["real_hat"], g_out["imag_hat"])
-                real_r, real_i, real_m = power_law_compress(g_out["real"], g_out["imag"])
+                    # Use Raw Waveform as Target (Trim to match length)
+                    min_len = min(wav_hat.shape[1], inputs_wav.shape[2])
+                    wav_hat = wav_hat[:, :min_len]
+                    wav_target = inputs_wav[:, 0, :min_len] # [B, T]
+                    
+                # Forward D
+                # Detach wav_hat to prevent G update
+                d_fake_out, _ = discriminator(wav_hat.detach())
+                d_real_out, _ = discriminator(wav_target)
                 
-                d_fake_out, _ = discriminator(fake_r.detach(), fake_i.detach(), fake_m.detach()) # Detach for D training
-                d_real_out, _ = discriminator(real_r, real_i, real_m)
-                
+                # Calculate Hinge Loss
                 d_loss_step = hinge_loss(d_fake_out, d_real_out)
                 
-                if torch.isnan(d_loss_step) or torch.isinf(d_loss_step):
-                    print(f"Warning: D Loss is NaN/Inf ({d_loss_step.item()}). Skipping D step.")
-                    opt_d.zero_grad()
-                else:
-                    accelerator.backward(d_loss_step)
-                    accelerator.clip_grad_norm_(discriminator.parameters(), 1.0)
-                    opt_d.step()
-                    
-                    d_loss = d_loss_step # Update d_loss for logging
-                    last_d_loss = d_loss.item()
-                    epoch_d_loss += d_loss.item()
+                # Backward D
+                accelerator.backward(d_loss_step)
                 
-                # --- Calculate D Accuracy ---
+                # Clip Gradients
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
+                
+                opt_d.step()
+                
+                d_loss = d_loss_step
+                epoch_d_loss += d_loss.item()
+                last_d_loss = d_loss.item()
+                
+                # Calculate Accuracy
                 with torch.no_grad():
-                    # Real Acc: Count logits > 0 (or > 1 for strict margin)
-                    # Let's use > 0 as decision boundary for "Real"
-                    if isinstance(d_real_out, list):
-                        real_correct = 0
-                        real_total = 0
-                        fake_correct = 0
-                        fake_total = 0
-                        for dr, df in zip(d_real_out, d_fake_out):
-                            real_correct += (dr > 0).float().sum().item()
-                            real_total += dr.numel()
-                            fake_correct += (df < 0).float().sum().item()
-                            fake_total += df.numel()
-                        
-                        acc_real = real_correct / (real_total + 1e-7)
-                        acc_fake = fake_correct / (fake_total + 1e-7)
-                    else:
-                        acc_real = (d_real_out > 0).float().mean().item()
-                        acc_fake = (d_fake_out < 0).float().mean().item()
+                    # Flatten list of outputs
+                    fake_logits = torch.cat([x.flatten() for x in d_fake_out])
+                    real_logits = torch.cat([x.flatten() for x in d_real_out])
                     
-                    epoch_d_real_acc += acc_real
-                    epoch_d_fake_acc += acc_fake
+                    epoch_d_real_acc += (real_logits > 0).float().mean().item()
+                    epoch_d_fake_acc += (fake_logits < 0).float().mean().item()
                     d_steps += 1
             
-            # --- Train Generator ---
+            # ---------------------
+            # Train Generator
+            # ---------------------
+            # Only train G if not in warmup
             if not is_warmup:
                 opt_g.zero_grad()
                 
-                # Forward Generator (grad)
-                g_out = model(inputs)
-                
-                # Check for NaN immediately
-                if torch.isnan(g_out["real_hat"]).any() or torch.isnan(g_out["imag_hat"]).any():
-                     print(f"CRITICAL: G output NaN in Train Step (Batch {batch_idx}). Skipping.")
-                     opt_g.zero_grad()
-                     continue
-                
-                # --- Reconstruct Waveforms via OLA for Loss ---
-                # Hop Length in Samples
-                hop_length = int(sr * hop_ms / 1000)
-                
-                # Create Synthesis Window (Hanning)
-                # Must match frame_len used in model
-                frame_len = inputs.shape[-1]
-                window = torch.hann_window(frame_len).to(device)
+                # Forward G
+                g_out = model(inputs, quantize=True)
                 
                 # Reconstruct Pred Waveform
-                # g_out["frames_hat"] are reconstructed frames (already effectively windowed by analysis)
-                # So OLA(frames_hat, window) gives frames_hat * window -> x * w^2
-                wav_hat = overlap_add(g_out["frames_hat"], hop_length, window)
+                # Apply window to frames_hat to match wav_target's WOLA reconstruction (x * w^2)
+                # wav_target is derived from inputs * window, so it becomes inputs * window^2 after overlap_add
+                # So we must window frames_hat too.
+                wav_hat = overlap_add(g_out["frames_hat"] * window.view(1, 1, -1), hop_length, window)
                 
-                # Reconstruct Target Waveform (from input frames)
-                # Inputs are RAW frames (unwindowed).
-                # We must window them first to get correct OLA reconstruction (Weighted OLA)
-                inputs_windowed = inputs * window.unsqueeze(0).unsqueeze(0)
-                wav_target = overlap_add(inputs_windowed, hop_length, window)
-                
-                # Trim to match length (just in case)
-                min_len = min(wav_hat.shape[1], wav_target.shape[1])
+                # Use Raw Waveform as Target (Trim to match length)
+                min_len = min(wav_hat.shape[1], inputs_wav.shape[2])
                 wav_hat = wav_hat[:, :min_len]
-                wav_target = wav_target[:, :min_len]
+                wav_target = inputs_wav[:, 0, :min_len] # [B, T]
                 
                 # --- Losses ---
+                total_g_loss = torch.tensor(0.0, device=device)
                 
+                # Helper to add loss if weight > 0
+                def add_loss(loss_val, weight):
+                    if weight > 0:
+                        return loss_val * weight
+                    return torch.tensor(0.0, device=device)
+
                 # 1. Multi-Scale STFT Loss (Mag + LogMag) on Waveforms
-                loss_ms_mag, loss_ms_log_mag = ms_stft(wav_hat, wav_target)
+                loss_ms_mag = torch.tensor(0.0, device=device)
+                loss_ms_log_mag = torch.tensor(0.0, device=device)
+                if W_MAG > 0 or W_LOG_MAG > 0:
+                    loss_ms_mag, loss_ms_log_mag = ms_stft(wav_hat, wav_target)
+                    total_g_loss += add_loss(loss_ms_mag, W_MAG)
+                    total_g_loss += add_loss(loss_ms_log_mag, W_LOG_MAG)
                 
                 # 2. Time Domain L1 Loss (Strong Phase Constraint)
-                loss_time = F.l1_loss(wav_hat, wav_target)
+                loss_time = torch.tensor(0.0, device=device)
+                if W_TIME > 0:
+                    loss_time = F.l1_loss(wav_hat, wav_target)
+                    total_g_loss += add_loss(loss_time, W_TIME)
                 
                 # 3. Complex Spectrogram L1 Loss (Frame-level, still useful for local structure)
-                loss_real = F.l1_loss(g_out["real_hat"], g_out["real"])
-                loss_imag = F.l1_loss(g_out["imag_hat"], g_out["imag"])
-                loss_complex = loss_real + loss_imag
+                loss_complex = torch.tensor(0.0, device=device)
+                if W_COMPLEX > 0:
+                    loss_real = F.l1_loss(g_out["real_hat"], g_out["real"])
+                    loss_imag = F.l1_loss(g_out["imag_hat"], g_out["imag"])
+                    loss_complex = loss_real + loss_imag
+                    total_g_loss += add_loss(loss_complex, W_COMPLEX)
 
                 # 4. SI-SDR Loss (Differentiable Metric)
                 # Maximize SI-SDR => Minimize -SI-SDR
                 # wav_hat and wav_target are [B, T]
-                sisdr_val = calculate_sisdr(wav_target, wav_hat)
-                loss_sisdr = -torch.mean(sisdr_val)
+                loss_sisdr = torch.tensor(0.0, device=device)
+                if W_SISDR > 0:
+                    sisdr_val = calculate_sisdr(wav_target, wav_hat)
+                    loss_sisdr = -torch.mean(sisdr_val)
+                    total_g_loss += add_loss(loss_sisdr, W_SISDR)
 
                 # Commit Loss (Weighted in model)
                 commit_loss = g_out["commit_loss"]
+                total_g_loss += add_loss(commit_loss, W_COMMIT)
                 
                 # GAN Loss (Generator wants D to predict real)
-                # D returns (scores, features)
-                fake_r, fake_i, fake_m = power_law_compress(g_out["real_hat"], g_out["imag_hat"])
-                # We need to re-compute real features for feature matching
-                real_r, real_i, real_m = power_law_compress(g_out["real"], g_out["imag"])
+                loss_adv = torch.tensor(0.0, device=device)
+                loss_feat = torch.tensor(0.0, device=device)
 
-                d_fake_for_g, d_fake_feats = discriminator(fake_r, fake_i, fake_m)
-                d_real_for_g, d_real_feats = discriminator(real_r, real_i, real_m)
-                
-                loss_adv = 0
-                loss_feat = 0
-                
-                if isinstance(d_fake_for_g, list):
-                    # Multi-Scale
+                if ENABLE_GAN and (W_ADV > 0 or W_FEAT > 0):
+                    # Wavs are already reconstructed as wav_hat, wav_target
+                    
+                    # D returns (scores, features)
+                    # Note: wav_hat here has gradients from G
+                    d_fake_for_g, d_fake_feats = discriminator(wav_hat)
+                    
+                    # Real Features (No Grad for D, No Grad for Real)
+                    with torch.no_grad():
+                        d_real_for_g, d_real_feats = discriminator(wav_target)
+                    
+                    # CombinedDiscriminator always returns list
+                    loss_adv = 0.0
                     for score in d_fake_for_g:
                         loss_adv += -torch.mean(score)
-                    loss_adv /= len(d_fake_for_g)                    
+                    loss_adv /= len(d_fake_for_g)
                     
                     # Feature Matching
-                    loss_feat = torch.tensor(0.0, device=device)
                     if W_FEAT > 0:
                         loss_feat = feature_matching_loss(d_real_feats, d_fake_feats)
-                    
-                else:
-                    loss_adv = -torch.mean(d_fake_for_g)
-                    loss_feat = feature_matching_loss([d_real_feats], [d_fake_feats]) if W_FEAT > 0 else torch.tensor(0.0, device=device)
+                
+                total_g_loss += add_loss(loss_adv, W_ADV)
+                total_g_loss += add_loss(loss_feat, W_FEAT)
                 
                 # Check for NaN/Inf
                 if torch.isnan(loss_adv) or torch.isinf(loss_adv):
@@ -495,19 +502,10 @@ def main():
                 # We want Rec Loss to dominate slightly or be equal.
                 
                 # 5. Mel Spectrogram Loss (New! Key for PESQ)
-                loss_mel = mel_loss_fn(wav_hat, wav_target)
-
-                total_g_loss = (
-                    W_ADV * loss_adv +
-                    W_FEAT * loss_feat +          # Added Feature Matching
-                    W_MAG * loss_ms_mag +        
-                    W_LOG_MAG * loss_ms_log_mag + 
-                    W_MEL * loss_mel +            # Mel Loss
-                    W_COMPLEX * loss_complex +
-                    W_COMMIT * commit_loss +
-                    W_TIME * loss_time +            # Use W_TIME variable
-                    W_SISDR * loss_sisdr            # SI-SDR Loss
-                )
+                loss_mel = torch.tensor(0.0, device=device)
+                if W_MEL > 0:
+                    loss_mel = mel_loss_fn(wav_hat, wav_target)
+                    total_g_loss += add_loss(loss_mel, W_MEL)
                 
                 # Check Total Loss
                 if torch.isnan(total_g_loss) or torch.isinf(total_g_loss):
@@ -540,15 +538,116 @@ def main():
                                 print(f"    {name}: {norm:.4f}")
                         except Exception as e:
                             print(f"  Error analyzing gradients: {e}")
-                    
-                    # Skip only if truly insane (like > 20000) or NaN
-                    if torch.isnan(grad_norm) or grad_norm > 20000: 
-                        print(f"Skipping G step due to exploding gradients: {grad_norm}")
-                        if torch.isnan(grad_norm):
-                             print("  Finding NaN Gradients:")
-                             for name, p in model.named_parameters():
-                                 if p.grad is not None and torch.isnan(p.grad).any():
-                                     print(f"    NaN Grad in: {name}")
+                        '''
+                        # Skip only if truly insane (like > 20000) or NaN
+                        if torch.isnan(grad_norm) or grad_norm > 20000: 
+                            print(f"Skipping G step due to exploding gradients: {grad_norm}")
+                            if torch.isnan(grad_norm):
+                                print("  Finding NaN Gradients...")
+                                # 1. Identify which parameter has NaN grad
+                                nan_params = []
+                                for name, p in model.named_parameters():
+                                    if p.grad is not None and torch.isnan(p.grad).any():
+                                        nan_params.append(name)
+                                        print(f"    NaN Grad in: {name}")
+                                
+                                # 2. Diagnose which LOSS caused it (Expensive but useful)
+                                print("  --- DIAGNOSING NAN SOURCE (Re-Forwarding...) ---")
+                                opt_g.zero_grad()
+                                
+                                # Re-run forward pass to rebuild graph for individual loss backward
+                                # (We can't reuse previous graph because it's gone)
+                                try:
+                                    g_out_debug = model(inputs)
+                                    
+                                    # Reconstruct wav_hat (same as main loop)
+                                    wav_hat_debug = overlap_add(g_out_debug["frames_hat"] * window.view(1, 1, -1), hop_length, window)
+                                    
+                                    # Reconstruct wav_target (same as main loop)
+                                    inputs_windowed_debug = inputs * window.unsqueeze(0).unsqueeze(0)
+                                    wav_target_debug = overlap_add(inputs_windowed_debug, hop_length, window)
+                                    
+                                    # Trim
+                                    min_len = min(wav_hat_debug.shape[1], wav_target_debug.shape[1])
+                                    wav_hat_debug = wav_hat_debug[:, :min_len]
+                                    wav_target_debug = wav_target_debug[:, :min_len]
+                                    
+                                    debug_losses = {}
+                                    
+                                    # Re-calculate individual losses
+                                    if W_MAG > 0 or W_LOG_MAG > 0:
+                                        l_mag, l_log = ms_stft(wav_hat_debug, wav_target_debug)
+                                        if W_MAG > 0: debug_losses["Mag"] = l_mag
+                                        if W_LOG_MAG > 0: debug_losses["LogMag"] = l_log
+                                        
+                                    if W_MEL > 0:
+                                        debug_losses["Mel"] = mel_loss_fn(wav_hat_debug, wav_target_debug)
+                                        
+                                    if W_TIME > 0:
+                                        debug_losses["Time"] = F.l1_loss(wav_hat_debug, wav_target_debug)
+                                        
+                                    if W_SISDR > 0:
+                                        # Careful with SI-SDR stability
+                                        sisdr_val = calculate_sisdr(wav_target_debug, wav_hat_debug)
+                                        debug_losses["SISDR"] = -torch.mean(sisdr_val)
+                                    
+                                    debug_losses["Commit"] = g_out_debug["commit_loss"]
+                                    
+                                    if ENABLE_GAN and (W_ADV > 0 or W_FEAT > 0):
+                                        # real_hat_debug = g_out_debug["real_hat"].permute(0, 2, 1).unsqueeze(1)
+                                        # imag_hat_debug = g_out_debug["imag_hat"].permute(0, 2, 1).unsqueeze(1)
+                                        # real_target_debug = g_out_debug["real"].permute(0, 2, 1).unsqueeze(1)
+                                        # imag_target_debug = g_out_debug["imag"].permute(0, 2, 1).unsqueeze(1)
+
+                                        d_fake, d_fake_f = discriminator(wav_hat_debug)
+                                        d_real, d_real_f = discriminator(wav_target_debug)
+                                        
+                                        if isinstance(d_fake, list):
+                                            if W_ADV > 0:
+                                                l_adv = 0
+                                                for s in d_fake: l_adv += -torch.mean(s)
+                                                debug_losses["Adv"] = l_adv / len(d_fake)
+                                            if W_FEAT > 0:
+                                                debug_losses["Feat"] = feature_matching_loss(d_real_f, d_fake_f)
+                                        else:
+                                            if W_ADV > 0: debug_losses["Adv"] = -torch.mean(d_fake)
+                                            if W_FEAT > 0: debug_losses["Feat"] = feature_matching_loss([d_real_f], [d_fake_f])
+
+                                    # Check each loss gradient
+                                    print("  Checking Gradients for each Loss:")
+                                    for name, loss in debug_losses.items():
+                                        if loss.requires_grad:
+                                            opt_g.zero_grad()
+                                            # Backward specific loss
+                                            # retain_graph=True in case we share graph (though here we loop sequentially)
+                                            # Actually we need retain_graph=True for all except last, 
+                                            # but since we might break early, let's just use it.
+                                            loss.backward(retain_graph=True)
+                                            
+                                            # Check gradient of a known NaN param (from step 1) or just first layer
+                                            found_nan = False
+                                            
+                                            # Check specifically the params that were NaN before
+                                            check_list = nan_params if nan_params else [n for n,p in model.named_parameters() if p.requires_grad]
+                                            
+                                            for param_name in check_list:
+                                                # Find param by name
+                                                param = dict(model.named_parameters())[param_name]
+                                                if param.grad is not None and torch.isnan(param.grad).any():
+                                                    print(f"    !!! NAN DETECTED from Loss: [{name}] in param [{param_name}] !!!")
+                                                    found_nan = True
+                                                    break
+                                            
+                                            if not found_nan:
+                                                print(f"    Loss [{name}] Gradients OK.")
+                                                
+                                    opt_g.zero_grad() # Clean up
+                                    
+                                except Exception as e:
+                                    print(f"  Debug Diagnosis Failed: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                        '''
                     else:
                         opt_g.step()
                 
@@ -570,9 +669,8 @@ def main():
                 else:
                     print(
                         f"\rEpoch {epoch+1} [{bar}] {batch_idx}/{total_batches} "
-                        f"G: {total_g_loss.item():.4f}| "
-                        f"Adv: {loss_adv.item():.4f} Feat: {loss_feat.item():.4f} "
-                        f"Mel: {loss_mel.item():.4f} LogMag: {loss_ms_log_mag.item():.4f} "
+                        f"G: {total_g_loss.item():.4f}| Commit: {commit_loss.item():.4f} "
+                        f"Mel: {loss_mel.item():.4f} ADV: {loss_adv.item():.4f} "
                         f"SISDR: {loss_sisdr.item():.4f} ",
                         end="",
                         flush=True,
@@ -580,6 +678,24 @@ def main():
 
         # Track D Loss
         avg_epoch_d_loss = epoch_d_loss / total_batches
+        
+        # Cleanup End of Loop Variables to prevent OOM
+        # Use try-except to avoid errors if variables weren't created (e.g. skipped batch)
+        try:
+            del g_out, inputs
+        except: pass
+        
+        try:
+            del wav_hat, wav_target, inputs_windowed
+        except: pass
+        
+        try:
+            del d_fake_for_g, d_fake_feats, d_real_for_g, d_real_feats
+        except: pass
+        
+        try:
+            del total_g_loss, loss_adv, loss_feat, loss_mel, loss_ms_mag, loss_ms_log_mag, loss_time, loss_complex, loss_sisdr, commit_loss
+        except: pass
         
         # Calculate D Metrics for logging
         avg_d_real_acc = epoch_d_real_acc / d_steps if d_steps > 0 else 0.0
@@ -590,14 +706,26 @@ def main():
             print(f"Epoch {epoch+1} finished. Avg D Loss: {avg_epoch_d_loss:.4f} Avg G Loss: {epoch_g_loss/total_batches:.4f}")
             print(f"    D Acc: Real {avg_d_real_acc:.2%} | Fake {avg_d_fake_acc:.2%}")
 
+        # Force GC at end of epoch
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Step Scheduler
         sched_g.step()
-        sched_d.step()
+        if ENABLE_GAN:
+            sched_d.step()
         
         # Validation
         if val_dataloader:
-            model.eval()
-            discriminator.eval()
+            # Important: Keep model in training mode for BatchNorm/Dropout consistency if stats are poor
+            # However, standard practice is eval(). 
+            # If silence occurs in eval() but not train(), it usually means BatchNorm stats are off (running_mean/var not updated correctly or diverse enough).
+            # Given the custom complex architecture and potential for instability, let's try force eval() but monitor.
+            # actually, let's stick to eval() but if the user reports silence, it's a huge hint.
+            
+            model.eval() 
+            if ENABLE_GAN:
+                discriminator.eval()
             val_total_loss = 0.0
             val_loss_mag = 0.0
             val_loss_log_mag = 0.0
@@ -608,11 +736,19 @@ def main():
             val_stoi = 0.0
             val_sisdr = 0.0
             val_count = 0
+            metric_count = 0 # Track batches with expensive metrics
             
             with torch.no_grad():
                 for batch in val_dataloader:
                     inputs = batch["inputs_features"]
-                    g_out = model(inputs)
+                    inputs_wav = batch["inputs_wav"].to(device).unsqueeze(1) # [B, 1, T]
+
+                    # Use same inference mode as training (Continuous or Quantized)
+                    # For stage2, we use quantize=False
+                    # But if we are in normal training, we might use True. 
+                    # Let's align with the training loop's setting.
+                    # Since we hardcoded quantize=False in training loop for this stage, we should do same here.
+                    g_out = model(inputs, quantize=True)
                     
                     # --- Reconstruct Waveforms via OLA for Loss ---
                     hop_length = int(sr * hop_ms / 1000)
@@ -620,24 +756,34 @@ def main():
                     window = torch.hann_window(frame_len).to(device)
                     
                     # Reconstruct Pred Waveform
-                    wav_hat = overlap_add(g_out["frames_hat"], hop_length, window)
+                    wav_hat = overlap_add(g_out["frames_hat"] * window.view(1, 1, -1), hop_length, window)
                     
-                    # Reconstruct Target Waveform
-                    inputs_windowed = inputs * window.unsqueeze(0).unsqueeze(0)
-                    wav_target = overlap_add(inputs_windowed, hop_length, window)
-                    
-                    # Trim
-                    min_len = min(wav_hat.shape[1], wav_target.shape[1])
+                    # Use Raw Waveform as Target
+                    min_len = min(wav_hat.shape[1], inputs_wav.shape[2])
                     wav_hat = wav_hat[:, :min_len]
-                    wav_target = wav_target[:, :min_len]
+                    wav_target = inputs_wav[:, 0, :min_len]
                     
                     # --- Metrics ---
-                    # Compute objective metrics (PESQ, STOI, SI-SDR)
-                    # We compute this for every batch in validation
-                    batch_metrics = compute_metrics_batch(wav_target, wav_hat, sr)
-                    val_pesq += batch_metrics["PESQ"]
-                    val_stoi += batch_metrics["STOI"]
-                    val_sisdr += batch_metrics["SI-SDR"]
+                    # 1. SI-SDR (Fast, GPU-friendly, needed for Loss)
+                    sisdr_batch = calculate_sisdr(wav_target, wav_hat)
+                    val_sisdr += sisdr_batch.mean().item()
+                    
+                    # 2. Expensive Metrics (PESQ, STOI) - Limit to first 10 batches to save time
+                    if val_count < 10:
+                        # Move to CPU for PESQ/STOI
+                        refs_np = wav_target.detach().cpu().numpy()
+                        ests_np = wav_hat.detach().cpu().numpy()
+                        
+                        p_sum = 0
+                        s_sum = 0
+                        batch_sz = len(refs_np)
+                        for i in range(batch_sz):
+                            p_sum += calculate_pesq(refs_np[i], ests_np[i], sr)
+                            s_sum += calculate_stoi(refs_np[i], ests_np[i], sr)
+                        
+                        val_pesq += p_sum / batch_sz
+                        val_stoi += s_sum / batch_sz
+                        metric_count += 1
                     
                     # --- Losses ---
                     loss_ms_mag, loss_ms_log_mag = ms_stft(wav_hat, wav_target)
@@ -650,29 +796,36 @@ def main():
                     commit_loss = g_out["commit_loss"]
                     
                     # Calculate ADV Loss for consistency (using D in eval mode)
-                    # D returns (scores, features)
-                    fake_r, fake_i, fake_m = power_law_compress(g_out["real_hat"], g_out["imag_hat"])
-                    real_r, real_i, real_m = power_law_compress(g_out["real"], g_out["imag"])
-                    
-                    d_fake_for_g, d_fake_feats = discriminator(fake_r, fake_i, fake_m)
-                    d_real_for_g, d_real_feats = discriminator(real_r, real_i, real_m)
-                    
-                    loss_adv = 0
-                    loss_feat = 0
-                    
-                    if isinstance(d_fake_for_g, list):
+                    loss_adv = torch.tensor(0.0, device=device)
+                    loss_feat = torch.tensor(0.0, device=device)
+
+                    if ENABLE_GAN:
+                        # Ensure correct shape for Discriminator
+                        # real_hat_val = g_out["real_hat"].permute(0, 2, 1).unsqueeze(1)
+                        # imag_hat_val = g_out["imag_hat"].permute(0, 2, 1).unsqueeze(1)
+                        # real_target_val = g_out["real"].permute(0, 2, 1).unsqueeze(1)
+                        # imag_target_val = g_out["imag"].permute(0, 2, 1).unsqueeze(1)
+
+                        # CombinedDiscriminator takes waveform [B, 1, T]
+                        # wav_hat and wav_target are already computed above [B, T]
+                        
+                        d_fake_for_g, d_fake_feats = discriminator(wav_hat)
+                        d_real_for_g, d_real_feats = discriminator(wav_target)
+                        
+                        loss_adv = 0
+                        loss_feat = 0
+                        
+                        # CombinedDiscriminator always returns list
                         for score in d_fake_for_g:
                             loss_adv += -torch.mean(score)
                         loss_adv /= len(d_fake_for_g)
                         
-                        loss_feat = feature_matching_loss(d_real_feats, d_fake_feats)
-                    else:
-                        loss_adv = -torch.mean(d_fake_for_g)
-                        loss_feat = feature_matching_loss([d_real_feats], [d_fake_feats])
+                        if W_FEAT > 0:
+                            loss_feat = feature_matching_loss(d_real_feats, d_fake_feats)
                     
                     # SI-SDR Loss (using metric value since no_grad)
                     # batch_metrics["SI-SDR"] is average dB
-                    loss_sisdr = - batch_metrics["SI-SDR"]
+                    loss_sisdr = -torch.mean(sisdr_batch)
 
                     total_g_loss = (
                         W_ADV * loss_adv +
@@ -705,12 +858,12 @@ def main():
             avg_complex = val_loss_complex / val_count if val_count > 0 else 0.0
             avg_adv = val_loss_adv / val_count if val_count > 0 else 0.0
             
-            avg_pesq = val_pesq / val_count if val_count > 0 else 0.0
-            avg_stoi = val_stoi / val_count if val_count > 0 else 0.0
+            avg_pesq = val_pesq / metric_count if metric_count > 0 else 0.0
+            avg_stoi = val_stoi / metric_count if metric_count > 0 else 0.0
             avg_sisdr = val_sisdr / val_count if val_count > 0 else 0.0
             
             if accelerator.is_main_process:
-                print(f"=== Epoch {epoch+1} Val Loss: {avg_val_loss:.4f} (Mag: {avg_mag:.4f}, Time: {avg_time:.4f}) ===")
+                print(f"=== Epoch {epoch+1} Val Loss: {avg_val_loss:.4f} (Mag: {avg_mag:.4f}, Time: {avg_time:.4f}, ADV: {avg_adv:.4f}) ===")
                 print(f"    Metrics: PESQ={avg_pesq:.4f}, STOI={avg_stoi:.4f}, SI-SDR={avg_sisdr:.2f} dB")
                 
                 # CSV Log
@@ -751,8 +904,9 @@ def main():
                 torch.save(unwrapped_model.state_dict(), os.path.join(save_path, "codec_model.pth"))
                 
                 # Save Discriminator too
-                unwrapped_d = accelerator.unwrap_model(discriminator)
-                torch.save(unwrapped_d.state_dict(), os.path.join(save_path, "discriminator_model.pth"))
+                if ENABLE_GAN and discriminator is not None:
+                    unwrapped_d = accelerator.unwrap_model(discriminator)
+                    torch.save(unwrapped_d.state_dict(), os.path.join(save_path, "discriminator_model.pth"))
                 
                 print(f"Saved checkpoint to {save_path}")
 

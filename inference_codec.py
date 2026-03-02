@@ -10,10 +10,23 @@ def load_model(checkpoint_path, device):
     # Config matches training
     sr = 16000
     frame_ms = 32.0
-    hop_ms = 8.0
+    hop_ms = 10.0 # Updated to 10.0
     freqs = custom_freqs.to(device)
     
-    model = AudioCodec(sr=sr, freqs=freqs, frame_ms=frame_ms, hop_ms=hop_ms)
+    # Matches train_audio_codec.py configuration
+    n_quantizers = 20
+    n_codebook = [1024, 1024, 512, 512, 256, 256, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 32, 32, 32, 32]
+    quantizer_weights = [1.0 * (0.8 ** i) for i in range(n_quantizers)]
+
+    model = AudioCodec(
+        sr=sr, 
+        freqs=freqs, 
+        frame_ms=frame_ms, 
+        hop_ms=hop_ms,
+        n_quantizers=n_quantizers,
+        n_codebook=n_codebook,
+        quantizer_weights=quantizer_weights
+    )
     
     # Load weights
     print(f"Loading checkpoint from {checkpoint_path}...")
@@ -51,19 +64,13 @@ def infer(model, input_wav_path, output_dir):
     print(f"Input frames shape: {frames.shape}")
     
     with torch.no_grad():
-        out = model(frames)
+        out = model(frames, quantize=True)
         
     # Reconstruct Waveform from Spectrogram
-    # out["real_hat"]: [B, T, F]
-    # out["imag_hat"]: [B, T, F]
+    # model.forward() now returns "frames_hat" which is already decompressed (Inverse Power-Law)
+    # and converted to time-domain frames.
     
-    real_hat = out["real_hat"]
-    imag_hat = out["imag_hat"]
-    
-    # Convert back to time domain frames
-    # vector2frame returns windowed frames if training used windowing
-    
-    recon_frames = vector2frame(real_hat, imag_hat, model.sr, model.freqs, frames.shape[-1]) # [B, T, Frame_Len]
+    recon_frames = out["frames_hat"] # [B, T, Frame_Len]
     
     # Overlap-Add with Window Correction
     hop_length = int(model.sr * model.hop_ms / 1000)
